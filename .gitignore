@@ -1,0 +1,24 @@
+# Secrets - never commit. .env.example documents the keys instead.
+.env
+.env.*
+!.env.example
+
+# Competition data. Not redistributed: it is downloadable from the challenge Data
+# tab, and the image archive alone is 421 MB. Section 3 fetches it on first run.
+data/
+Train.csv
+Test.csv
+SampleSubmission.csv
+manifest-*.json
+
+# Run outputs: image cache, checkpoints, TensorBoard events, submissions.
+artifacts/
+logs/
+submission.csv
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/

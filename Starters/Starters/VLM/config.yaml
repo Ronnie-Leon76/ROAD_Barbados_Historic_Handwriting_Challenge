@@ -1,0 +1,34 @@
+general:
+  repo_root: "/workspace/barbados-road-challenge"  # relative from scripts/VLM to repo root
+
+training:
+  model_id: "Qwen/Qwen2-VL-2B-Instruct"
+  train_csv: "scripts/data/Train.csv"
+  base_image_dir: "scripts/data/images"
+  output_dir: "./qwen2-vl-ocr"
+  per_device_train_batch_size: 8
+  gradient_accumulation_steps: 2
+  num_train_epochs: 3
+  learning_rate: 0.00003
+  dataloader_num_workers: 4
+  max_pixels: 1500000
+  use_bf16: true
+  debug: false
+  r: 16
+  lora_alpha: 32
+
+inference:
+  model_path: "./qwen2-vl-ocr/final"
+  test_csv: "code/scripts/data/Test.csv"
+  base_image_dir: "code/scripts/data/images"
+  output_csv: "submission.csv"
+  device: "auto"
+  use_bf16: false
+  max_new_tokens: 128
+  num_beams: 3
+
+evaluation:
+  pred_csv: "submission.csv"
+  pub_gt: "data/pub_ref.csv"
+  priv_gt: "data/priv_ref.csv"
+  weight_factor: 0.5

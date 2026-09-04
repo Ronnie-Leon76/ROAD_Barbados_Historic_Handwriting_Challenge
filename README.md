@@ -55,7 +55,11 @@ so a full-fine-tuned 4B fold is a strong extra member in the ROVER vote.
    cards, but the 8B configuration is what the defaults target.
 2. Put `Train.csv`, `Test.csv` and `SampleSubmission.csv` next to the notebook.
    `images.zip` is downloaded automatically on first run.
-3. Run all cells. With the default `CFG.train_folds = (0,)` a full pass takes roughly
+3. Run all cells.  Section 1 installs its own dependencies, so nothing is needed
+   beforehand. Outside the notebook — for `run_pipeline.py`, or to build the image
+   for a pod — use `pip install -r requirements.txt`. PyTorch is not in that file
+   on purpose: the right wheel depends on your CUDA version, and every GPU image
+   already ships one. With the default `CFG.train_folds = (0,)` a full pass takes roughly
    two hours end to end.
 4. For a competitive submission set `CFG.train_folds = (0, 1, 2, 3, 4)` and re-run —
    ensembling across folds is the single most reliable improvement in the pipeline.
@@ -177,6 +181,7 @@ The organisers' discussion-board rulings are enforced rather than assumed:
 ROAD_Barbados_HTR_SOTA.ipynb   generated notebook — the interactive deliverable
 run_pipeline.py                generated script — the unattended deliverable
 run_background.sh / .ps1       detached launcher
+requirements.txt               pins for a non-notebook environment (no torch)
 .env / .env.example            secrets (gitignored) and their template
 build/parts/p*.py              source cells, jupytext "percent" format, in run order
 build/build_notebook.py        parts -> .ipynb
@@ -198,4 +203,6 @@ python build/selftest.py          # ~4 minutes, needs the data present
 
 `selftest.py` runs the data, metric, split, image, StackMix and fusion sections
 against the real images on CPU, and checks the metric, ROVER, character LM and
-lexicon repair against known-answer cases.
+lexicon repair against known-answer cases. It also asserts that `requirements.txt`
+and the notebook's install cell list exactly the same packages, so the two cannot
+drift apart unnoticed.

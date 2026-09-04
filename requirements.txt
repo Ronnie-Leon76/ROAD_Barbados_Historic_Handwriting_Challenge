@@ -1,0 +1,52 @@
+# Dependencies for the R.O.A.D. Barbados handwriting pipeline.
+#
+#     pip install -r requirements.txt
+#
+# PyTorch is deliberately absent. The correct wheel depends on the CUDA version of
+# the machine, so installing it from here would either pull a CPU-only build or fight
+# the one a GPU pod already ships with. Every rented pod and every Colab/Kaggle image
+# has torch preinstalled; if yours does not, install it first from the index that
+# matches your driver (https://pytorch.org/get-started/locally/). torch >= 2.4 is
+# what the rest of these pins were tested against.
+#
+# These are the same pins the notebook installs in Section 1, and build/selftest.py
+# fails if the two lists ever drift apart.
+
+# --- model stack -------------------------------------------------------------
+# transformers is pinned exactly: Qwen3-VL's processor emits a different visual
+# token layout across minor releases, which silently changes the patch grid.
+transformers==4.57.1
+accelerate>=1.10.0
+peft>=0.17.0
+# trl is pinned exactly because GRPOTrainer's reward-function signature is not stable.
+trl==0.23.0
+datasets>=3.0.0
+bitsandbytes>=0.47.0
+sentencepiece
+safetensors
+huggingface_hub>=0.34.0
+
+# --- image, text and metric ---------------------------------------------------
+opencv-python-headless>=4.9
+pillow>=10.2
+rapidfuzz>=3.9
+jiwer>=3.0
+scikit-learn>=1.4
+scipy>=1.11
+matplotlib>=3.8
+pandas>=2.1
+tqdm
+pyyaml
+tensorboard>=2.16
+
+# --- optional -----------------------------------------------------------------
+# FlashAttention-2 roughly halves attention memory on long lines, which is what
+# makes batch 8 fit at line_height 160. It is optional: the model falls back to
+# SDPA automatically when the import fails. Install it separately, because it needs
+# a flag and a source build on an unsupported platform costs ~40 minutes:
+#
+#     pip install "flash-attn>=2.7.0" --no-build-isolation --no-cache-dir
+#
+# --no-cache-dir is required on pods where /tmp and the workspace are different
+# mounts: pip otherwise hard-links the downloaded wheel across devices and fails
+# with EXDEV (errno 18) even though the wheel itself is fine.

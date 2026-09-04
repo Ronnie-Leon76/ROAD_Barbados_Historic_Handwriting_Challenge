@@ -62,6 +62,46 @@ def run_part(ns: dict, name: str, skip_cells: Sequence[int] = ()) -> None:
         exec(compile(src, f"{name}#cell{i}", "exec"), ns)
 
 
+def notebook_pins() -> set:
+    """The package specs the notebook's Section 1 install cell passes to pip."""
+    import ast
+
+    tree = ast.parse((PARTS / "p01_intro.py").read_text(encoding="utf-8"))
+    specs = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and getattr(node.func, "id", "") == "pip"):
+            continue
+        for arg in node.args:
+            if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                spec = arg.value
+                if spec.startswith("-") or spec == "pip":
+                    continue        # flags and `pip install --upgrade pip`
+                specs.add(spec)
+    return specs
+
+
+def requirements_pins() -> set:
+    lines = (ROOT / "requirements.txt").read_text(encoding="utf-8").split("\n")
+    return {ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")}
+
+
+def check_requirements() -> None:
+    """requirements.txt and the notebook install cell must not drift apart."""
+    nb = notebook_pins()
+    req = requirements_pins()
+    # flash-attn is deliberately not installed by `pip install -r`: it needs
+    # --no-build-isolation, and the model falls back to SDPA without it.
+    optional = {s for s in nb if s.startswith("flash-attn")}
+    assert optional, "the notebook no longer installs flash-attn; update this check"
+    core = nb - optional
+    assert not (core - req), f"missing from requirements.txt: {sorted(core - req)}"
+    assert not (req - core), f"in requirements.txt but not installed by the notebook: {sorted(req - core)}"
+    text = (ROOT / "requirements.txt").read_text(encoding="utf-8")
+    assert "--no-build-isolation" in text and "--no-cache-dir" in text, \
+        "requirements.txt should document how to install flash-attn on a split-mount pod"
+    print(f"    requirements.txt matches the notebook ({len(core)} pins + flash-attn)")
+
+
 def prelude(fast: bool) -> dict:
     """Stand-in for the torch-dependent bootstrap cells."""
     ns: dict = {}
@@ -128,6 +168,7 @@ def main() -> int:
     ns = prelude(args.fast)
 
     print("=" * 70, "\n[1/8] config", sep="")
+    check_requirements()
     # Config cell defines Config/CFG/paths; the licence guard needs the network.
     cfg_cells = cells_of(PARTS / "p02_config.py")
     exec(compile(cfg_cells[0], "p02#0", "exec"), ns)

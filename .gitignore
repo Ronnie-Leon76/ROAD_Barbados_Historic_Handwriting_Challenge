@@ -13,6 +13,9 @@ artifacts/
 logs/
 submission.csv
 
+# Local pip / flash-attn download scratch (kept on the workspace mount).
+.cache/
+
 # Python
 __pycache__/
 *.py[cod]

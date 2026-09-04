@@ -289,7 +289,9 @@ if ARGS.email:
 #
 # On RunPod choose a **PyTorch 2.6+ / CUDA 12.4+** template. If the base image ships
 # an older torch, the cell prints a warning instead of silently producing a broken
-# environment.
+# environment. FlashAttention-2 is installed from a prebuilt wheel with the pip
+# cache disabled so a `/tmp` vs `/workspace` split cannot raise EXDEV; if no
+# matching wheel exists the model falls back to SDPA and training still runs.
 #
 # To mirror checkpoints to the Hugging Face Hub, set a **write** token before running
 # `Section 2.3` — on RunPod the cleanest way is a pod secret, so the token never
@@ -311,10 +313,18 @@ INSTALL_FLASH_ATTENTION = RUN_INSTALL   # falls back to SDPA if the wheel fails
 if RUN_INSTALL:
     import subprocess
     import sys
+    from pathlib import Path
 
-    def pip(*args: str) -> None:
+    def pip(*args: str, extra_env: dict | None = None, cwd: str | None = None) -> int:
         print("pip", *args)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args], check=False)
+        env = None
+        if extra_env:
+            env = _os.environ.copy()
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *args],
+            check=False, env=env, cwd=cwd,
+        ).returncode
 
     pip("--upgrade", "pip")
     pip(
@@ -341,9 +351,80 @@ if RUN_INSTALL:
         "pyyaml",
         "tensorboard>=2.16",
     )
+
+    def _flash_attn_ok() -> bool:
+        try:
+            import flash_attn  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _download_flash_attn_wheel(dest_dir: Path) -> Path | None:
+        """Fetch the same GitHub wheel flash-attn's setup.py would have guessed."""
+        try:
+            import torch
+            import urllib.request
+        except Exception:
+            return None
+        if sys.platform != "linux":
+            return None
+        py = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        torch_mm = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+        try:
+            abi = "TRUE" if bool(torch._C._GLIBCXX_USE_CXX11_ABI) else "FALSE"
+        except Exception:
+            abi = "TRUE"
+        for ver in ("2.8.3.post1", "2.8.3", "2.8.2", "2.7.4.post1", "2.7.3"):
+            name = (f"flash_attn-{ver}+cu12torch{torch_mm}cxx11abi{abi}"
+                    f"-{py}-{py}-linux_x86_64.whl")
+            url = ("https://github.com/Dao-AILab/flash-attention/releases/"
+                   f"download/v{ver}/{name}")
+            path = dest_dir / name.replace("+", "-")
+            print(f"[env] trying {url}")
+            try:
+                urllib.request.urlretrieve(url, path)
+                if path.stat().st_size > 1_000_000:
+                    return path
+            except Exception as exc:
+                print(f"[env]   {exc}")
+            path.unlink(missing_ok=True)
+        return None
+
+    def install_flash_attn() -> None:
+        """Install a prebuilt wheel without crossing filesystems.
+
+        flash-attn downloads a matching GitHub wheel, then pip `os.rename`s it
+        into its cache. On rented pods /tmp and /workspace are often different
+        mounts, which raises EXDEV (errno 18) and looks like a failed source
+        build even though a good wheel was just fetched. Keep temp files on the
+        workspace, skip the pip wheel cache, and never fall through to a CUDA
+        compile (~40 minutes on a pod).
+        """
+        if _flash_attn_ok():
+            print("[env] flash-attn already installed")
+            return
+        root = Path.cwd() / ".cache"
+        tmp = root / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        env = {
+            "TMPDIR": str(tmp), "TEMP": str(tmp), "TMP": str(tmp),
+            "FLASH_ATTENTION_SKIP_CUDA_BUILD": "TRUE",
+        }
+        rc = pip("flash-attn>=2.7.0", "--no-build-isolation", "--no-cache-dir",
+                 extra_env=env, cwd=str(tmp))
+        if rc == 0 or _flash_attn_ok():
+            print("[env] flash-attn installed")
+            return
+        wheel = _download_flash_attn_wheel(tmp)
+        if wheel is not None and (pip(str(wheel), extra_env=env, cwd=str(tmp)) == 0
+                                  or _flash_attn_ok()):
+            print(f"[env] flash-attn installed from {wheel.name}")
+            return
+        print("[env] flash-attn unavailable; attention will use SDPA. "
+              "Training still runs, just uses more VRAM per step.")
+
     if INSTALL_FLASH_ATTENTION:
-        # Prebuilt wheels only; a source build on a rented pod costs ~40 minutes.
-        pip("flash-attn>=2.7.0", "--no-build-isolation")
+        install_flash_attn()
 
 import gc
 import json

@@ -7,9 +7,11 @@
 # `--resize new` rebuilds the CTC head on the challenge alphabet. The pretrained
 # 44-language softmax would spend most of its mass on scripts that never appear
 # in Barbados secretary hand, and (ketos docs) "rapidly unlearn missing labels"
-# if left in place. `--freeze-backbone` for the first ~2 epochs lets that new
-# head settle before the visual tower moves. `--schedule cosine` matches the
-# original PP-OCRv6 recipe.
+# if left in place. Do **not** pass `--freeze-backbone`: that flag is vgsl-only
+# and ketos rejects it for `ppocrv6`. Do **not** use `-q early`: Lightning then
+# sets `max_epochs=-1`, `estimated_stepping_batches` is inf, and the Muon cosine
+# schedule does `int(inf)` (kraken#792). `-q fixed -N 50` is the working recipe.
+# `--schedule cosine` matches the original PP-OCRv6 training.
 #
 # Every fold is trained. A 16 M model on 3 300 lines is minutes, not hours, and
 # five independent hypotheses are the single biggest lever the VLM run left on
@@ -53,18 +55,33 @@ def write_manifest(paths: Sequence[Path], path: Path) -> Path:
     return path
 
 
+# NRTR positional encoding is 2048 tokens; PP-OCRv6 width stride is 8.
+# ketos raises if max_width // 8 + 2 exceeds that.
+PPOCRV6_NRTR_MAX_WIDTH = (2048 - 2) * 8  # 16368
+PPOCRV6_DEFAULT_MAX_WIDTH = 2560
+UNSUPPORTED_FLAG_RE = re.compile(r"Option (--[\w-]+) is not supported")
+
+
 def width_report(paths: Sequence[Path], height: int) -> dict:
     widths = []
     for p in paths:
         with Image.open(p) as im:
             w, h = im.size
-        widths.append(w * height / max(h, 1))
-    widths = np.asarray(widths) if len(widths) else np.zeros(1)
-    auto = int(math.ceil((widths.max() + 64) / 64.0) * 64)
+        if w < 1 or h < 1:
+            continue
+        widths.append(w * height / h)
+    widths = np.asarray(widths, dtype=float) if len(widths) else np.array([PPOCRV6_DEFAULT_MAX_WIDTH], dtype=float)
+    finite = widths[np.isfinite(widths)]
+    if finite.size == 0:
+        finite = np.array([PPOCRV6_DEFAULT_MAX_WIDTH], dtype=float)
+    auto = int(math.ceil((float(finite.max()) + 64) / 64.0) * 64)
     limit = CFG.max_line_width or auto
-    return {"n": int(len(widths)), "max": int(widths.max()),
-            "p99": float(np.percentile(widths, 99)), "max_width": int(limit),
-            "over_limit": int((widths > limit).sum())}
+    if not math.isfinite(limit) or limit < 1:
+        limit = PPOCRV6_DEFAULT_MAX_WIDTH
+    limit = int(min(limit, PPOCRV6_NRTR_MAX_WIDTH))
+    return {"n": int(len(widths)), "max": int(finite.max()),
+            "p99": float(np.percentile(finite, 99)), "max_width": limit,
+            "over_limit": int((finite > limit).sum())}
 
 
 def ketos_bin() -> str:
@@ -82,6 +99,19 @@ def ketos_train_cmd(base: Path, train_m: Path, val_m: Path, out_dir: Path,
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     precision = "bf16-mixed" if (torch.cuda.is_available()
                                  and torch.cuda.is_bf16_supported()) else "32-true"
+    # kraken#792: -q early => Lightning max_epochs=-1 => int(inf) in the
+    # ppocrv6 Muon cosine schedule. Always train a fixed budget on this arch.
+    quit = "fixed" if CFG.quit == "early" else (CFG.quit or "fixed")
+    if quit != CFG.quit:
+        print(f"[train] ppocrv6 cannot use -q {CFG.quit} (kraken#792); "
+              f"using -q {quit} -N {CFG.epochs}")
+    try:
+        max_w = int(max_width)
+    except (TypeError, OverflowError, ValueError):
+        max_w = PPOCRV6_DEFAULT_MAX_WIDTH
+    if not math.isfinite(max_w) or max_w < 1:
+        max_w = PPOCRV6_DEFAULT_MAX_WIDTH
+    max_w = min(max_w, PPOCRV6_NRTR_MAX_WIDTH)
     cmd = [ketos_bin(), "-v", "-d", device, "--precision", precision,
            "--workers", str(min(8, max(1, CFG.dataloader_workers))),
            "-s", str(CFG.seed),
@@ -89,14 +119,14 @@ def ketos_train_cmd(base: Path, train_m: Path, val_m: Path, out_dir: Path,
            "-u", "NFD", "--normalize-whitespace",
            "-t", str(train_m), "-e", str(val_m), "-o", str(out_dir),
            "-B", str(CFG.batch_size), "-N", str(CFG.epochs),
-           "-q", CFG.quit, "-F", "1",
+           "-q", quit, "-F", "1",
            "--lrate", str(CFG.lr), "--warmup", str(CFG.warmup),
-           "--schedule", CFG.schedule, "--optimizer", CFG.optimizer,
-           "--max-width", str(max_width)]
-    if CFG.freeze_backbone:
-        cmd += ["--freeze-backbone", str(CFG.freeze_backbone)]
-    if CFG.quit == "early" and CFG.min_epochs:
-        cmd += ["--min-epochs", str(CFG.min_epochs)]
+           "--max-width", str(max_w)]
+    if CFG.schedule:
+        cmd += ["--schedule", CFG.schedule]
+    if CFG.optimizer:
+        cmd += ["--optimizer", CFG.optimizer]
+    # `--freeze-backbone` is vgsl-only; ketos refuses it for architecture ppocrv6.
     cmd.append("--augment" if CFG.augment else "--no-augment")
     return cmd
 
@@ -105,18 +135,25 @@ FLAG_WITH_VALUE = {"--min-epochs", "--schedule", "--optimizer", "--freeze-backbo
 FLAG_BARE = {"--normalize-whitespace"}
 
 
-def slim_ketos(cmd: list) -> list:
-    """Drop optional flags that some kraken 7.x builds do not recognise."""
+def drop_ketos_flag(cmd: list, flag: str) -> list:
+    """Remove one CLI flag (and its value, if it takes one)."""
     out, skip = [], False
     for tok in cmd:
         if skip:
             skip = False
             continue
-        if tok in FLAG_BARE | FLAG_WITH_VALUE:
-            skip = tok in FLAG_WITH_VALUE
+        if tok == flag:
+            skip = flag in FLAG_WITH_VALUE and flag not in FLAG_BARE
             continue
         out.append(tok)
     return out
+
+
+def force_quit_fixed(cmd: list) -> list:
+    out = list(cmd)
+    if "-q" in out:
+        out[out.index("-q") + 1] = "fixed"
+    return drop_ketos_flag(out, "--min-epochs")
 
 
 def best_weights(out_dir: Path) -> Path | None:
@@ -260,11 +297,22 @@ def train_one(tag: str, base: Path, tr_df: pd.DataFrame, va_df: pd.DataFrame) ->
     (LOGS / f"train_{tag}.log").unlink(missing_ok=True)
     cmd = ketos_train_cmd(base, tr_m, va_m, out_dir, widths["max_width"])
     rc = run_logged(cmd, LOGS / f"train_{tag}.log")
+    log_txt = (LOGS / f"train_{tag}.log").read_text(encoding="utf-8", errors="replace")
     if rc != 0:
-        # kraken minor releases drop/rename optional flags; retry a slimmer command.
-        slim = slim_ketos(cmd)
-        print(f"[train] {tag}: retry without optional flags")
-        rc = run_logged(slim, LOGS / f"train_{tag}.log")
+        # Drop only the flag ketos named as unsupported (e.g. --freeze-backbone
+        # on ppocrv6). Do not strip --optimizer/--schedule: that silently
+        # switches to AdamW+Muon and then -q early hits kraken#792 (int(inf)).
+        hit = UNSUPPORTED_FLAG_RE.search(log_txt)
+        if hit:
+            cmd = drop_ketos_flag(cmd, hit.group(1))
+            print(f"[train] {tag}: retry without {hit.group(1)}")
+            rc = run_logged(cmd, LOGS / f"train_{tag}.log")
+            log_txt = (LOGS / f"train_{tag}.log").read_text(encoding="utf-8", errors="replace")
+    if rc != 0 and ("cannot convert float infinity to integer" in log_txt
+                    or "OverflowError" in log_txt):
+        cmd = force_quit_fixed(cmd)
+        print(f"[train] {tag}: retry with -q fixed (kraken#792)")
+        rc = run_logged(cmd, LOGS / f"train_{tag}.log")
     weights = best_weights(out_dir)
     log = (LOGS / f"train_{tag}.log").read_text(encoding="utf-8", errors="replace")
     dropped = log.count("Failed. Replacing")

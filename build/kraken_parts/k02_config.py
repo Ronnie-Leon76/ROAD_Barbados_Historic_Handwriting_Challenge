@@ -57,17 +57,21 @@ class Config:
     seed: int = 42
     deterministic: bool = True
 
-    # ketos
+    # ketos. PP-OCRv6 rejects `--freeze-backbone` (vgsl-only) and crashes on
+    # `-q early`: Lightning then sets max_epochs=-1, `estimated_stepping_batches`
+    # is inf, and the default AdamW+Muon cosine schedule does int(inf)
+    # (kraken#792). Use a fixed epoch budget. Leave optimizer empty so ketos
+    # keeps the architecture default (AdamW+Muon).
     resize: str = "new"                 # new | union  (see markdown above)
     epochs: int = 50
     min_epochs: int = 15
-    quit: str = "early"                 # early | fixed
+    quit: str = "fixed"                 # fixed | early  (early is unsafe on ppocrv6)
     lr: float = 3e-4
     warmup: int = 200
-    freeze_backbone: int = 200          # steps; ~2 epochs at batch 32
+    freeze_backbone: int = 0            # 0 = omit; ppocrv6 does not support it
     batch_size: int = 32
     schedule: str = "cosine"
-    optimizer: str = "Adam"
+    optimizer: str = ""                 # "" = architecture default (AdamW+Muon)
     augment: bool = True
     line_height: int = 128              # PP-OCRv6 medium native height
     max_line_width: int = 0             # 0 = derive so ketos drops nothing

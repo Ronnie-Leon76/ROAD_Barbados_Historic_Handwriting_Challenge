@@ -36,7 +36,8 @@ def build_pseudo_labels(nbest: dict, min_agreement: float = 1.0,
 
 
 if CFG.use_pseudo_labels:
-    PSEUDO = build_pseudo_labels(TEST_NBEST)
+    PSEUDO = build_pseudo_labels({i: [c for c in v if family_of(c) == "vlm"]
+                                  for i, v in TEST_NBEST.items()})
     print("!! Pseudo-labelling is enabled. Confirm the organisers permit it before "
           "submitting a solution trained this way.")
     # Retrain fold 0 with the pseudo-labelled lines appended, then re-run Section 14.
@@ -63,7 +64,10 @@ TEST_FOLD_OF = {i: -1 for i in TEST_IDS}   # -1 => resources built from all of T
 fold_resources(-1)
 
 TEST_FEATS = build_features(TEST_NBEST, TEST_IDS, TEST_FOLD_OF,
-                            restrict=POST.restrict_charset, collapse=POST.collapse)
+                            restrict=POST.restrict_charset, collapse=POST.collapse,
+                            families=POST.families)
+print(f"[submit] members: {' + '.join(POST.families)}"
+      f"{'' if POST.use_ctc or not HAS_CTC else '  (kraken CTC rejected by the OOF gate)'}")
 TEST_PRED = apply_post(TEST_FEATS, TEST_IDS, POST,
                        lexicon_for=lambda i: FOLD_LEX[-1])
 
@@ -82,7 +86,9 @@ if submission.Target.isna().any():
 n_empty = int((submission.Target.str.strip() == "").sum())
 if n_empty:
     problems.append(f"{n_empty} empty predictions (scored as fully incorrect)")
-    fallback = top1(TEST_NBEST)
+    # VLM beams only: CTC confidences live on a different scale.
+    fallback = top1({i: [c for c in cands if family_of(c) == "vlm"] or cands
+                     for i, cands in TEST_NBEST.items()})
     mask = submission.Target.str.strip() == ""
     submission.loc[mask, "Target"] = [normalize_text(fallback.get(i, "the")) or "the"
                                       for i in submission.loc[mask, "ID"]]
@@ -131,11 +137,17 @@ manifest = {
     "stackmix_enabled": bool(CFG.stackmix),
     "pseudo_labels_used": bool(CFG.use_pseudo_labels),
     "grpo_used": bool(CFG.run_grpo),
+    "ctc_branch": CTC_STATUS,
+    "ctc_model": CFG.ctc_model_id if CFG.ctc_branch else None,
+    "ctc_model_licence": CTC_LICENCE,
+    "ctc_used_in_submission": bool(POST.use_ctc),
+    "ctc_report": CTC_REPORT,
+    "tuned_member_sets": {k: round(v[1], 5) for k, v in TUNED.items()},
     "hub_repo": CFG.hf_repo_id or None,
     "hub_errors": HUB.errors,
 }
 with open(OUT / "run_manifest.json", "w") as fh:
-    json.dump(manifest, fh, indent=2)
+    json.dump(manifest, fh, indent=2, default=str)
 with open(OUT / "post_config.json", "w") as fh:
     json.dump(asdict(POST), fh, indent=2)
 
@@ -158,6 +170,8 @@ HUB.write_card(model_card(
         "OOF score (after fusion)": f"{best_val:.5f}",
         "OOF score (raw top-1)": f"{BASELINE['score']:.5f}",
         "weighted CER / WER": f"{BASELINE['cer']:.4f} / {BASELINE['wer']:.4f}",
+        "kraken PP-OCRv6 member": ("used" if POST.use_ctc else "not used")
+                                  + f" ({CTC_STATUS})",
     },
 ))
 
@@ -176,6 +190,14 @@ for r in RUNS:
         extra = f"  [grpo {r['grpo_scores']['delta']:+.5f} {kept}]"
     print(f"  {r['tag']:<24} val {r['best']['score']:.5f} "
           f"({r['best']['source']}, step {r['best']['step']}, {r.get('minutes', 0):.0f} min){extra}")
+print(f"kraken CTC branch   {CTC_STATUS}")
+if CTC_REPORT.get("zero_shot"):
+    print(f"  zero-shot PP-OCRv6          {CTC_REPORT['zero_shot']['score']:.5f}")
+if CTC_REPORT.get("oof_top1"):
+    print(f"  fine-tuned CTC top-1 OOF    {CTC_REPORT['oof_top1']['score']:.5f}")
+if "gate_delta" in CTC_REPORT:
+    print(f"  fusion gate                 {'kept' if CTC_REPORT['gate_kept'] else 'dropped'}"
+          f" ({CTC_REPORT['gate_delta']:+.5f} OOF)")
 print(f"OOF before post-processing   {BASELINE['score']:.5f}")
 print(f"OOF after post-processing    {best_val:.5f}   ({best_val - BASELINE['score']:+.5f})")
 print(f"submission                   {SUB_PATH}")
@@ -218,6 +240,13 @@ NOTIFY.finished(best_val, BASELINE["score"], SUB_PATH)
 #    how much of it to buy: `grpo_steps` is the knob, and the printed
 #    `[grpo] SFT x vs GRPO y` line tells you whether more would pay. If the delta is
 #    positive and still growing at 300 steps, raise it.
-# 7. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
+# 7. **Read the kraken CTC verdict.** The summary prints the zero-shot and
+#    fine-tuned PP-OCRv6 scores and whether the fusion gate kept it. If the
+#    fine-tuned CTC top-1 is within a few thousandths of the VLM, it is a genuine
+#    second opinion: try `ctc_epochs=80`, `ctc_line_height=128` with
+#    `ctc_max_width=5120`, or StackMix lines in its training set. If it is far
+#    behind, it still earns its place through the `c_sim` anchor on the lines where
+#    the VLM loops — check the gate delta rather than dropping it on instinct.
+# 8. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
 #    at high aspect ratios, they are being squashed by `max_line_width` and deserve a
 #    dedicated higher-budget decoding pass.

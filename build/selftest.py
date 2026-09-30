@@ -181,6 +181,9 @@ def main() -> int:
     except RuntimeError:
         print("    licence guard correctly blocked the research-licensed model")
     assert licence_ok, "licence guard failed to block a non-commercial model"
+    assert ns["check_licence"](ns["CFG"].ctc_model_id) == "apache-2.0", \
+        "kraken PP-OCRv6 member must pass the licence guard"
+    print("    licence guard accepts the kraken PP-OCRv6 member")
 
     # Full fine-tune derivation must refuse the one combination that cannot work.
     _cfg4bit = ns["Config"](finetune_mode="full", load_in_4bit=True)
@@ -320,6 +323,9 @@ def main() -> int:
     run_part(ns, "p14_fusion.py")
     exercise_postprocessing(ns)
 
+    print("=" * 70, "\n[8b/8] kraken CTC branch helpers (no kraken needed)", sep="")
+    exercise_ctc_helpers(ns)
+
     print("=" * 70)
     print("SELFTEST PASSED")
     return 0
@@ -384,10 +390,92 @@ def exercise_postprocessing(ns: dict) -> None:
     assert kept == "Sealed and delivered in the prsence of us", kept
     print(f"    archaic spelling preserved: {kept!r}")
 
+    # --- kraken CTC member: absent => identical features, present => anchor works.
+    feats_v = ns["build_features"](nbest, ids, fold_of, families=("vlm",))
+    assert all(np.array_equal(feats[i]["M"], feats_v[i]["M"]) for i in ids[:50]), \
+        "VLM-only features must not change when no CTC candidates exist"
+    assert all((feats[i]["M"][:, 6:] == 0).all() for i in ids[:50])
+
+    # VLM beams hallucinate a looped tail; the CTC member reads the line but with
+    # its own (smaller) character errors. The anchor should pull selection back.
+    nb2 = {}
+    for image_id, ref in zip(ids, refs):
+        loop = ref + " of the of the said"
+        cands = [{"text": loop, "score": -0.05, "view": f"v{v}", "rank": 0}
+                 for v in range(3)]
+        cands.append({"text": corrupt(ref, 0.01), "score": -0.3, "view": "v0", "rank": 1})
+        for v in range(3):
+            cands.append({"text": corrupt(ref, 0.03), "score": -0.2, "view": f"ctc:{v}",
+                          "rank": 0, "family": "ctc", "model": "ctc_fold0"})
+        nb2[image_id] = cands
+    f_all = ns["build_features"](nb2, ids, fold_of, families=("vlm", "ctc"))
+    f_vlm = ns["build_features"](nb2, ids, fold_of, families=("vlm",))
+    pc_v = ns["PostConfig"](use_rover=False, repair=False)
+    pc_c = ns["PostConfig"](use_rover=False, repair=False, use_ctc=True,
+                            w_ctc_sim=3.0, w_ctc_votes=0.3)
+    s_v = ns["competition_score"](refs, [ns["apply_post"](f_vlm, ids, pc_v)[i] for i in ids])["score"]
+    s_c = ns["competition_score"](refs, [ns["apply_post"](f_all, ids, pc_c)[i] for i in ids])["score"]
+    print(f"    CTC anchor on looping VLM output: VLM-only {s_v:.4f} -> +CTC {s_c:.4f}")
+    assert s_c > s_v + 0.02, "CTC anchor failed to reject looped VLM hypotheses"
+    assert pc_c.families == ("vlm", "ctc") and pc_v.families == ("vlm",)
+
     assert ns["collapse_repeats"]("of the of the of the of the of the") == "of the of the of the"
     kept_chars = ns["restrict_charset"]("and \u00e9\u00f1\u4e2d the")
     assert kept_chars == "and  the", repr(kept_chars)
     print("    collapse_repeats + charset restriction ok")
+
+
+def exercise_ctc_helpers(ns: dict) -> None:
+    """The GPU/venv-free half of Section 14.1: data export, commands, merging."""
+    import tempfile
+
+    exec(compile(cells_of(PARTS / "p13a_ctc.py")[0], "p13a#0", "exec"), ns)
+    cfg = ns["CFG"]
+    ccfg = ns["ctc_config"](cfg)
+    assert ccfg.line_height == cfg.ctc_line_height and cfg.line_height != 0
+    assert ns["ctc_folds"](cfg) == tuple(range(cfg.n_folds)), "() must mean every fold"
+
+    train_df = ns["train_df"]
+    ids, texts = train_df.ID.tolist()[:6], train_df.Target.tolist()[:6]
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        paths = ns["write_ctc_lines"](ids, texts, tmp / "lines", cfg)
+        assert all(p.exists() for p in paths)
+        for p, t in zip(paths, texts):
+            gt = p.parent / f"{p.stem}.gt.txt"
+            assert gt.read_text(encoding="utf-8") == t, "kraken path-format gt mismatch"
+        rep = ns["ctc_width_report"](paths, cfg)
+        import cv2 as _cv2
+        heights = {_cv2.imread(str(p), 0).shape[0] for p in paths}
+        print(f"    wrote {len(paths)} kraken lines, heights {sorted(heights)}, "
+              f"max width {rep['max']}px -> --max-width {rep['max_width']}")
+        assert rep["over_limit"] == 0, "sample lines would be dropped by ketos"
+        man = ns["write_manifest"](paths, tmp / "m.txt")
+        assert len(man.read_text().split()) == len(paths)
+
+        cmd = ns["ketos_train_cmd"](Path("ketos"), Path("base.safetensors"), man, man,
+                                    tmp / "out", cfg, max_width=rep["max_width"])
+        assert cmd[cmd.index("--max-width") + 1] == str(rep["max_width"])
+        joined = " ".join(cmd)
+        for flag in ("train", "-f path", "--resize union", "-u NFD", "--lrate",
+                     "--max-width", "-q fixed", "-i base.safetensors"):
+            assert flag in joined, f"ketos command lost {flag!r}"
+        assert cmd.index("train") > cmd.index("-d"), "global options must precede train"
+
+        (tmp / "out").mkdir()
+        for name in ("best_0.8123.safetensors", "best_0.9001.safetensors",
+                     "checkpoint_03-0.9001.ckpt"):
+            (tmp / "out" / name).write_bytes(b"x")
+        assert ns["best_ctc_weights"](tmp / "out").name == "best_0.9001.safetensors"
+    compile(ns["CTC_WORKER"], "ctc_worker", "exec")
+
+    df = pd.DataFrame({"ID": ids[:2], "text": [" a  b ", "c"], "score": [-0.1, -0.2],
+                       "view": "ctc:identity"})
+    nb = ns["ctc_frame_to_nbest"](df, "ctc_fold0")
+    assert nb[ids[0]][0]["text"] == "a b" and nb[ids[0]][0]["family"] == "ctc"
+    merged = ns["merge_nbest"]({ids[0]: [{"text": "x", "score": 0.0}]}, nb, only={ids[0]})
+    assert len(merged[ids[0]]) == 2 and ids[1] not in merged, "OOF merge must respect `only`"
+    print("    ketos command, weight discovery, worker source and N-best merge ok")
 
 
 if __name__ == "__main__":

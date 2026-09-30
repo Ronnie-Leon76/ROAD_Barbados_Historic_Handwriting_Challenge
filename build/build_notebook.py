@@ -6,7 +6,9 @@ executable ``.ipynb``.  Keeping the source as plain Python means the whole
 pipeline can be linted, diffed and syntax-checked without Jupyter.
 
 Usage:
-    python build/build_notebook.py [--out ROAD_Barbados_HTR_SOTA.ipynb] [--check]
+    python build/build_notebook.py [--out ROAD_Barbados_HTR_SOTA.ipynb]
+    python build/build_notebook.py --manifest build/kraken_manifest.txt \
+        --out ROAD_Barbados_HTR_Kraken.ipynb
 """
 
 from __future__ import annotations
@@ -56,8 +58,28 @@ def parse_percent_file(text: str):
     return cells
 
 
-def build(parts_dir: pathlib.Path, out_path: pathlib.Path) -> dict:
-    part_files = sorted(parts_dir.glob("p*.py"))
+def read_manifest(path: pathlib.Path) -> list[pathlib.Path]:
+    """Ordered part files for a notebook that mixes shared and specific parts.
+
+    One path per line, relative to the manifest's directory; blank lines and `#`
+    comments are ignored. This is how the kraken notebook reuses the data, metric,
+    split, image, StackMix and fusion cells of the main notebook verbatim.
+    """
+    files = []
+    for raw in path.read_text(encoding="utf-8").split("\n"):
+        line = raw.split("#", 1)[0].strip()
+        if line:
+            files.append((path.parent / line).resolve())
+    missing = [str(f) for f in files if not f.exists()]
+    if missing:
+        raise SystemExit(f"manifest {path.name} lists missing parts: {missing}")
+    return files
+
+
+def build(parts_dir: pathlib.Path, out_path: pathlib.Path,
+          manifest: pathlib.Path | None = None) -> dict:
+    part_files = read_manifest(manifest) if manifest else sorted(
+        list(parts_dir.glob("p*.py")) + list(parts_dir.glob("k*.py")))
     if not part_files:
         raise SystemExit(f"No parts found in {parts_dir}")
 
@@ -111,9 +133,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--parts", default=str(root / "parts"))
     ap.add_argument("--out", default=str(root.parent / "ROAD_Barbados_HTR_SOTA.ipynb"))
+    ap.add_argument("--manifest", default=None,
+                    help="ordered list of part files (overrides --parts globbing)")
     args = ap.parse_args()
 
-    nb = build(pathlib.Path(args.parts), pathlib.Path(args.out))
+    nb = build(pathlib.Path(args.parts), pathlib.Path(args.out),
+               pathlib.Path(args.manifest) if args.manifest else None)
     n_code = sum(c["cell_type"] == "code" for c in nb["cells"])
     n_md = sum(c["cell_type"] == "markdown" for c in nb["cells"])
     n_lines = sum(len(c["source"]) for c in nb["cells"] if c["cell_type"] == "code")

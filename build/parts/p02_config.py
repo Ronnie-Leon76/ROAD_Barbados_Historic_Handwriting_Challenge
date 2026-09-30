@@ -10,6 +10,7 @@
 #
 # | Switch | Effect |
 # |---|---|
+# | `competition_mode` | **Leaderboard recipe**: all five folds + the kraken CTC branch. `--fast` and `--folds` still override it |
 # | `finetune_mode` | `"lora"` adapters (default) or `"full"` — every weight trained, with the learning rate, optimiser, batch shape and EMA re-derived to match |
 # | `run_grpo` | RL polish that optimises the leaderboard metric directly, kept only if it beats the SFT adapter out-of-fold |
 # | `hf_repo_id` | mirrors every checkpoint and artefact to the Hugging Face Hub so the run can be replayed exactly |
@@ -78,7 +79,11 @@ class Config:
 
     # --------------------------------------------------------------- splits --
     n_folds: int = 5
-    train_folds: tuple = (0,)              # which folds to actually train
+    # One fold is a plumbing check (the 0.905 public score). A leaderboard run
+    # needs every fold: that is the largest unused lever in this pipeline.
+    train_folds: tuple = (0,)
+    competition_mode: bool = True          # True -> all n_folds + CTC branch
+                                           # (--fast / CLI --folds still win)
     fold_seed: int = 20260703
 
     # ------------------------------------------------------------- training --
@@ -176,6 +181,35 @@ class Config:
     grpo_keep_if_better: bool = True       # revert to the SFT adapter when it loses
     grpo_eval_samples: int = 320
     use_pseudo_labels: bool = False        # OFF pending an organiser ruling
+
+    # ------------------------------------------------- kraken CTC branch --
+    # A second, architecturally different recogniser: kraken's PP-OCRv6 port, a
+    # 15.9M-parameter CTC line model (Apache-2.0), fine-tuned per fold on the same
+    # lines. CTC cannot loop or invent text the way an autoregressive decoder can,
+    # so it is used as an independent ROVER member and as an anchor that
+    # penalises VLM hypotheses which drift away from what is on the page. Section
+    # 15 tunes the fusion with and without it and keeps it only if it wins
+    # out-of-fold - enabling it cannot make the submission worse. See Section 14.1.
+    ctc_branch: bool = True
+    ctc_model_id: str = "small-models-for-glam/kraken-ppocrv6-medium"
+    ctc_model_file: str = "medium.safetensors"
+    ctc_kraken_version: str = "7.1.1"      # first release that trains ppocrv6
+    ctc_venv: str = ".venv_kraken"         # isolated: kraken pins torch/scipy/sklearn
+    ctc_torch_index: str = "https://download.pytorch.org/whl/cu126"
+    ctc_finetune: bool = True              # False = zero-shot base model only
+    ctc_folds: tuple = ()                  # () -> every fold; ~minutes each
+    ctc_epochs: int = 40
+    ctc_lr: float = 3e-4                   # base recipe used 1.05e-3 from scratch
+    ctc_warmup: int = 200                  # steps
+    ctc_batch_size: int = 32
+    ctc_line_height: int = 128             # the medium model's input height
+    # ketos height-normalises every line to ctc_line_height and silently DROPS
+    # training lines wider than --max-width afterwards; batches are padded to it.
+    # 0 = derive it from the data so no line is lost (Section 14.1 prints it).
+    ctc_max_width: int = 0
+    ctc_augment: bool = True
+    ctc_tta_modes: tuple = ("identity", "dark", "light")
+    ctc_infer_batch: int = 64
 
     # ------------------------------------------------------------ hugging face --
     # Set hf_repo_id to something like "your-name/road-barbados-htr" and export a
@@ -286,6 +320,10 @@ def apply_finetune_mode(cfg: Config, vram_gb: float) -> Config:
 # then win over them, and the mode/quantisation derivations run last so they see
 # the settings that will actually be used.
 CFG = autoscale(CFG, GPU_VRAM_GB)
+if CFG.competition_mode:
+    CFG.train_folds = tuple(range(CFG.n_folds))
+    CFG.ctc_branch = True
+    print(f"[cfg] COMPETITION MODE: training folds {CFG.train_folds} + kraken CTC")
 if not CFG.hf_repo_id:
     CFG.hf_repo_id = os.environ.get("HF_REPO_ID", "").strip()
 
@@ -351,6 +389,10 @@ KNOWN_LICENCES = {
     "microsoft/Florence-2-large": ("mit", True),
     "stepfun-ai/GOT-OCR2_0": ("apache-2.0", True),
     "allenai/olmOCR-7B-0225-preview": ("apache-2.0", True),
+    # kraken PP-OCRv6 ports (CTC line recognisers, Section 14.1). Verified 2026-09.
+    "small-models-for-glam/kraken-ppocrv6-medium": ("apache-2.0", True),
+    "small-models-for-glam/kraken-ppocrv6-small": ("apache-2.0", True),
+    "small-models-for-glam/kraken-ppocrv6-tiny": ("apache-2.0", True),
     # --- blocked ---
     "Qwen/Qwen2.5-VL-3B-Instruct": ("qwen-research", False),
     "stanford-oval/churro-3B": ("qwen-research", False),
@@ -397,3 +439,4 @@ def check_licence(model_id: str, strict: bool = True) -> str:
 
 
 CFG_LICENCE = check_licence(CFG.model_id)
+CTC_LICENCE = check_licence(CFG.ctc_model_id) if CFG.ctc_branch else None

@@ -29,15 +29,20 @@
 # 6. **GRPO stage** that optimises the competition metric directly as a reward on top
 #    of the SFT checkpoint. On by default and self-gating: the polished weights are
 #    scored against their parent on held-out data and discarded unless they win.
-# 7. **Reproducibility and checkpoint custody**: deterministic kernels, per-sample
+# 7. **A second, CTC recogniser**: kraken's PP-OCRv6 port (15.9M parameters,
+#    Apache-2.0) fine-tuned per fold in its own virtualenv. It cannot loop or
+#    hallucinate the way an autoregressive decoder can, so it joins the ROVER vote
+#    and anchors the rescoring — and, like GRPO, it is kept only if it wins
+#    out-of-fold (`Section 14.1`).
+# 8. **Reproducibility and checkpoint custody**: deterministic kernels, per-sample
 #    seeding, a run fingerprint over the input files and library versions, and
 #    optional mirroring of every checkpoint and artefact to the Hugging Face Hub —
 #    so a run can be replayed, or resumed on a fresh pod, to the same score.
-# 8. **Unattended operation**: the same cells build `run_pipeline.py`, a headless
+# 9. **Unattended operation**: the same cells build `run_pipeline.py`, a headless
 #    script that logs to file, streams TensorBoard curves (locally and to the hub),
 #    and emails you on every checkpoint upload, GRPO verdict, completion and
 #    failure. See `python build/build_script.py` and `./run_background.sh`.
-# 9. **Legible progress**: stage banners with elapsed wall clock, a `tqdm` bar on
+# 10. **Legible progress**: stage banners with elapsed wall clock, a `tqdm` bar on
 #    every long loop and a training heartbeat with a projected finish time — throttled
 #    automatically when the output is a log file rather than a terminal (`Section 2.6`).
 #
@@ -47,6 +52,15 @@
 # longer references carry more weight. The metric is re-implemented in
 # `Section 4` and unit-tested, so local validation numbers are directly comparable
 # to the leaderboard.
+#
+# ## How to actually win (read this before training another 8B fold-0)
+#
+# The 0.905 public score trained **one fold**. GRPO added 0.0004. First place is
+# 0.940. Do not swap to dots.ocr (custom licence) or chase another VLM from the
+# BHL printed-book board. Set `CFG.competition_mode = True` (the default): all
+# five folds of this Qwen pipeline **and** the kraken CTC branch. Then run
+# `ROAD_Barbados_Kraken_PP_OCRv6.ipynb` on a **separate** kernel and submit
+# both files plus the ensemble. Email alerts fire in both notebooks from `.env`.
 
 # %% [markdown]
 # ## 0. Rules compliance — read before changing model or data settings

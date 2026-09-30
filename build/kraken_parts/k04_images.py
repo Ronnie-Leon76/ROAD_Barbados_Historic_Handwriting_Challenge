@@ -3,15 +3,16 @@
 #
 # Same cleaning as the VLM notebook (flatten, deskew, horizontal ink-crop, CLAHE)
 # so a later ensemble is voting on reading, not on preprocessing. Height is 128 px
-# — the native PP-OCRv6 medium input — and width is **not** capped until ketos
-# sees the rescaled size, because ketos silently drops anything over `--max-width`.
+# — the native PP-OCRv6 medium input. Width is capped with slack for ketos
+# padding and augmentation; ketos *replaces* anything over `--max-width` in the
+# DataLoader, which tanks GPU utilisation.
 
 # %%
 import cv2
 from PIL import Image
 
 cv2.setNumThreads(0)
-CACHE_DIR = OUT / "cache" / f"h{CFG.line_height}"
+CACHE_DIR = OUT / "cache" / f"h{CFG.line_height}_w{CFG.max_line_width}"
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 

@@ -35,6 +35,24 @@
 # 7. Emails you on start, each fold, and finish (and the traceback on a crash),
 #    using the same `.env` SMTP settings as the Qwen notebook.
 #
+# ## How to run
+#
+# Fresh **PyTorch ≥ 2.9** kernel — not the Qwen kernel. Put `.env` next to the
+# notebook and **Run All**. This file already handles the ketos traps we hit on
+# the pod (`click` vs `huggingface_hub`, `--freeze-backbone`, `-q early` →
+# `int(inf)`, DataLoader replacements, L40S sitting idle at batch 8).
+#
+# Resume is automatic: `artifacts_kraken/kraken/preds/zeroshot_*.csv` and
+# `models/*/best_*.safetensors` are reused. Delete a fold directory only if that
+# fold crashed mid-write.
+#
+# | Card | What `tune_for_gpu` sets |
+# |---|---|
+# | ≥ 40 GB (L40S) | batch 48, `--max-width` 3200, 4 workers |
+# | ≥ 22 GB | batch 24, 2560, 4 workers |
+# | ≥ 14 GB | batch 12, 2560, 2 workers |
+# | smaller | batch 4, 1920, 2 workers |
+#
 # ## BHL board vs this challenge — do not pick one row
 #
 # The BHL table is **zero-shot printed books**. This challenge is **fine-tuned
@@ -83,14 +101,27 @@ if RUN_INSTALL:
                               check=False).returncode
 
     pip("--upgrade", "pip")
-    pip("huggingface_hub>=0.34.0", "opencv-python-headless>=4.9", "pillow>=10.2",
-        "rapidfuzz>=3.9", "scikit-learn>=1.4", "pandas>=2.1", "tqdm", "pyyaml",
-        "tensorboard>=2.16")
-    # kraken 7.1.1 is the first release that trains the PP-OCRv6 architecture.
-    rc = pip("kraken==7.1.1")
+    # kraken 7.1.1 requires click>=8.1,<8.3. huggingface-hub 2.x requires
+    # click>=8.4.2. Installing hub unpinned first pulls 2.0 and click 8.5, then
+    # kraken downgrades click to 8.2 and leaves hub 2.0 broken. Resolve as one set:
+    # hub 1.x is enough for hf_hub_download / model_info.
+    deps = (
+        "kraken==7.1.1",
+        "click>=8.1,<8.3",
+        "huggingface_hub>=0.34.0,<2.0.0",
+        "opencv-python-headless>=4.9",
+        "pillow>=10.2",
+        "rapidfuzz>=3.9",
+        "scikit-learn>=1.4",
+        "pandas>=2.1",
+        "tqdm",
+        "pyyaml",
+        "tensorboard>=2.16",
+    )
+    rc = pip(*deps)
     if rc != 0:
-        print("[env] kraken==7.1.1 failed; trying kraken>=7.1.0")
-        pip("kraken>=7.1.0")
+        print("[env] kraken==7.1.1 failed; retrying kraken>=7.1.0 with the same click pin")
+        pip("kraken>=7.1.0", *deps[1:])
 
 # %%
 import gc
@@ -115,6 +146,9 @@ import pandas as pd
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=FutureWarning)
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("TORCH_COMPILE_DISABLE", "1")
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -131,6 +165,10 @@ else:
 
 try:
     import kraken
+    import click as _click
+    import huggingface_hub as _hub
     print(f"kraken           {getattr(kraken, '__version__', 'unknown')}")
+    print(f"click            {_click.__version__}  (kraken needs >=8.1,<8.3)")
+    print(f"huggingface_hub  {_hub.__version__}  (must be <2 so it accepts click 8.2)")
 except Exception as exc:
     print(f"!! kraken import failed ({exc}). Re-run the install cell in a fresh kernel.")

@@ -10,6 +10,10 @@
 #    `"union"` only if zero-shot already reads the challenge charset well.
 # 4. `vlm_test_csv` — path to the Qwen `submission.csv`. Blended at test time
 #    when present; OOF-tuned if `vlm_oof_csv` is also present.
+#
+# Batch size and `--max-width` are **not** levers: `tune_for_gpu()` sets them
+# from VRAM so an L40S is fed and a 16 GB card does not OOM. Ketos is always
+# `-q fixed` with no `--freeze-backbone` (ppocrv6).
 
 # %%
 def load_dotenv(path: str | Path = ".env") -> list:
@@ -69,12 +73,12 @@ class Config:
     lr: float = 3e-4
     warmup: int = 200
     freeze_backbone: int = 0            # 0 = omit; ppocrv6 does not support it
-    batch_size: int = 32
+    batch_size: int = 8                 # overwritten by tune_for_gpu()
     schedule: str = "cosine"
     optimizer: str = ""                 # "" = architecture default (AdamW+Muon)
     augment: bool = True
     line_height: int = 128              # PP-OCRv6 medium native height
-    max_line_width: int = 0             # 0 = derive so ketos drops nothing
+    max_line_width: int = 2560          # overwritten by tune_for_gpu(); static pad
     min_line_width: int = 64
     min_line_height: int = 48
     max_upscale: float = 3.0
@@ -87,8 +91,8 @@ class Config:
     background_flatten: bool = True
 
     tta_modes: tuple = ("identity", "dark", "light", "sharp")
-    infer_batch: int = 64
-    dataloader_workers: int = 8
+    infer_batch: int = 16
+    dataloader_workers: int = 2
 
     lm_order: int = 7
     lm_tune_iters: int = 400
@@ -154,8 +158,32 @@ def set_seed(seed: int) -> None:
 
 
 set_seed(CFG.seed)
+
+
+def tune_for_gpu() -> None:
+    """Size the PP-OCRv6 static-pad rectangle to the card. Mutates CFG in place."""
+    vram = float(GPU_VRAM_GB)
+    if vram >= 40:
+        CFG.batch_size, CFG.max_line_width = 48, 3200
+        CFG.dataloader_workers, CFG.infer_batch = 4, 32
+    elif vram >= 22:
+        CFG.batch_size, CFG.max_line_width = 24, 2560
+        CFG.dataloader_workers, CFG.infer_batch = 4, 24
+    elif vram >= 14:
+        CFG.batch_size, CFG.max_line_width = 12, 2560
+        CFG.dataloader_workers, CFG.infer_batch = 2, 16
+    else:
+        CFG.batch_size, CFG.max_line_width = 4, 1920
+        CFG.dataloader_workers, CFG.infer_batch = 2, 8
+    CFG.quit = "fixed"
+    CFG.freeze_backbone = 0
+    print(f"[hw] {vram:.0f} GB -> batch {CFG.batch_size}  max_width {CFG.max_line_width}  "
+          f"workers {CFG.dataloader_workers}")
+
+
+tune_for_gpu()
 print(f"[cfg] {CFG.model_id} | folds {CFG.train_folds} | resize {CFG.resize} "
-      f"| {CFG.epochs} epochs {CFG.quit} | lr {CFG.lr:g}")
+      f"| {CFG.epochs} epochs {CFG.quit} | lr {CFG.lr:g} | batch {CFG.batch_size}")
 
 # %%
 from tqdm.auto import tqdm

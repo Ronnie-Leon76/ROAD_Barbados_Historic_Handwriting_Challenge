@@ -90,25 +90,25 @@ The Qwen LoRA run on one fold scored **0.90491 OOF / 0.90485 public**. First pla
 is **0.9399**. GRPO added `+0.00041`. That is a recogniser gap, not a fusion gap.
 
 `ROAD_Barbados_Kraken_PP_OCRv6.ipynb` is a **separate kernel**: do not run it
-inside the Qwen environment (kraken 7.1 wants `torch>=2.9`). It fine-tunes
-`small-models-for-glam/kraken-ppocrv6-medium` (Apache-2.0, 15.9 M, native line
-height 128) on **all five** group-aware folds, optionally the `small` sibling as
-a second CTC family, decodes with photometric TTA, and fuses with ROVER + a
-fold-safe character LM + lexicon repair. Crops are treated as **one line** — the
-starter-kit page segmenter is the wrong tool for this dataset.
+inside the Qwen environment (kraken 7.1 wants `torch>=2.9`). **Run All** on a
+PyTorch ≥ 2.9 image. The notebook pins `click<8.3` with `huggingface_hub<2`,
+trains PP-OCRv6 with `-q fixed` (no `--freeze-backbone`), sizes batch and
+`--max-width` to the card (L40S → batch 48 / width 3200), and rewrites line
+PNGs so ketos does not stall the GPU on `Failed. Replacing with sample`.
 
-If `submission_road_htr.csv` (the Qwen file) is next to the notebook it is blended
-in at test time, but only when the two strings are close. A fluent VLM
-hallucination is not allowed to overwrite a literal CTC reading.
+Crops are treated as **one line** — the starter-kit page segmenter is the wrong
+tool. If `submission_road_htr.csv` (the Qwen file) is next to the notebook it is
+blended at test time, but only when the two strings are close.
+
+Resume is automatic under `artifacts_kraken/`. Delete a fold's `models/` directory
+only if that fold crashed.
 
 ```bash
 python build/build_notebook.py --parts build/kraken_parts --out ROAD_Barbados_Kraken_PP_OCRv6.ipynb
 ```
 
-Run all cells on a fresh PyTorch 2.9+ image. A 16 M model does not need 40 GB;
-a 16 GB card is enough. Output: `submission_kraken.csv` and, when the Qwen file
-is present, `submission_ensemble.csv`. Submit both; keep whichever the public
-board prefers.
+Output: `submission_kraken.csv` and, when the Qwen file is present,
+`submission_ensemble.csv`. Submit both; keep whichever the public board prefers.
 
 ## Running it
 

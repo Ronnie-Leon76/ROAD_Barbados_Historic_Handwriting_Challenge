@@ -93,7 +93,7 @@ is **0.9399**. GRPO added `+0.00041`. That is a recogniser gap, not a fusion gap
 inside the Qwen environment (kraken 7.1 wants `torch>=2.9`). **Run All** on a
 PyTorch ≥ 2.9 image. The notebook pins `click<8.3` with `huggingface_hub<2`,
 trains PP-OCRv6 with `-q fixed` (no `--freeze-backbone`), sizes batch and
-`--max-width` to the card (L40S → batch 48 / width 3200), and rewrites line
+`--max-width` to the card (L40S → batch 24 / width 2560), and rewrites line
 PNGs so ketos does not stall the GPU on `Failed. Replacing with sample`.
 
 Crops are treated as **one line** — the starter-kit page segmenter is the wrong

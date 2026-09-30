@@ -202,11 +202,15 @@ def ketos_train_cmd(base: Path, train_m: Path, val_m: Path, out_dir: Path,
         cmd += ["--schedule", CFG.schedule]
     if CFG.optimizer:
         cmd += ["--optimizer", CFG.optimizer]
+    if CFG.tensorboard:
+        tb_dir = ketos_tb_dir(out_dir.name)
+        cmd += ["--logger", "tensorboard", "--log-dir", str(tb_dir)]
     cmd.append("--augment" if CFG.augment else "--no-augment")
     return cmd
 
 
-FLAG_WITH_VALUE = {"--min-epochs", "--schedule", "--optimizer", "--freeze-backbone"}
+FLAG_WITH_VALUE = {"--min-epochs", "--schedule", "--optimizer", "--freeze-backbone",
+                   "--logger", "--log-dir"}
 FLAG_BARE = {"--normalize-whitespace"}
 
 
@@ -434,6 +438,11 @@ def train_one(tag: str, base: Path, tr_df: pd.DataFrame, va_df: pd.DataFrame) ->
     if rc != 0 or weights is None:
         raise RuntimeError(f"ketos {tag} failed rc={rc}; see {LOGS / f'train_{tag}.log'}")
     print(f"[train] {tag}: {weights.name} in {fmt_hms(time.time() - t0)}")
+    log_ketos_val_curve(tag, log_txt)
+    if weights is not None:
+        HUB.push_file(weights, f"checkpoints/{tag}/{weights.name}",
+                      f"kraken {tag} {weights.name}")
+    HUB.push_folder(ketos_tb_dir(tag), f"runs/{tag}", f"tensorboard {tag}")
     return weights
 
 
@@ -473,6 +482,12 @@ def run_family(name: str, base: Path, family: str) -> list[dict]:
         REPORT[tag] = res
         print(f"[oof] {tag}: {res['score']:.5f}  CER {res['cer']:.4f}  WER {res['wer']:.4f}")
         NOTIFY.fold_done(tag, res["score"], res["cer"], res["wer"])
+        tb = TBLogger(tag, CFG.tensorboard)
+        tb.scalar("oof/score", res["score"], fold)
+        tb.scalar("oof/cer", res["cer"], fold)
+        tb.scalar("oof/wer", res["wer"], fold)
+        tb.close()
+        HUB.push_folder(ketos_tb_dir(tag), f"runs/{tag}", f"oof metrics {tag}")
         out.append({"tag": tag, "family": family, "fold": fold,
                     "oof": oof, "test": test, "score": res["score"]})
     return out

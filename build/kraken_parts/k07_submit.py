@@ -102,3 +102,15 @@ with open(OUT / "kraken_report.json", "w") as fh:
                "raw": RAW, "fused": FUSED, "post": asdict(POST),
                "config": {k: (list(v) if isinstance(v, tuple) else v)
                           for k, v in asdict(CFG).items()}}, fh, indent=2, default=str)
+HUB.push_file(SUB_PATH, "submission_kraken.csv", "kraken submission")
+if VLM_TEST:
+    HUB.push_file(ENS_PATH, "submission_ensemble.csv", "ensemble submission")
+HUB.push_file(OUT / "kraken_report.json", "kraken_report.json", "run report")
+HUB.write_card(kraken_model_card({
+    "OOF fused": f"{FUSED['score']:.5f}",
+    "OOF raw CTC": f"{RAW['score']:.5f}",
+    "OOF CER": f"{FUSED['cer']:.4f}",
+    "OOF WER": f"{FUSED['wer']:.4f}",
+}))
+HUB.push_folder(TBLogger.root, "runs", "final tensorboard")
+print(f"[hub] {'pushed to ' + CFG.hf_repo_id if HUB.enabled else 'skipped (no HF_REPO_ID)'}")

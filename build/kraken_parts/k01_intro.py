@@ -48,9 +48,9 @@
 #
 # | Card | What `tune_for_gpu` sets |
 # |---|---|
-# | ≥ 40 GB (L40S) | batch 48, `--max-width` 3200, 4 workers |
-# | ≥ 22 GB | batch 24, 2560, 4 workers |
-# | ≥ 14 GB | batch 12, 2560, 2 workers |
+# | ≥ 40 GB (L40S) | batch 24, `--max-width` 2560, 4 workers |
+# | ≥ 22 GB | batch 16, 2560, 4 workers |
+# | ≥ 14 GB | batch 8, 2560, 2 workers |
 # | smaller | batch 4, 1920, 2 workers |
 #
 # ## BHL board vs this challenge — do not pick one row

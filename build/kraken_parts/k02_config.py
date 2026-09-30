@@ -103,6 +103,8 @@ class Config:
     vlm_blend: float = 0.35             # used only when OOF VLM is missing
 
     hf_repo_id: str = ""
+    hf_token_env: str = "HF_TOKEN"
+    hf_private: bool = True
     notify_email: bool = True            # same .env SMTP keys as the Qwen notebook
     tensorboard: bool = True
 
@@ -161,16 +163,22 @@ set_seed(CFG.seed)
 
 
 def tune_for_gpu() -> None:
-    """Size the PP-OCRv6 static-pad rectangle to the card. Mutates CFG in place."""
+    """Size the PP-OCRv6 static-pad rectangle to the card. Mutates CFG in place.
+
+    The NRTR auxiliary head is the VRAM hog, not the 16 M CTC backbone. Batch 48
+    at width 3200 OOMs on an L40S; 24 × 2560 trains. Do not start from the
+    highest batch that *might* fit — the first OOM retry costs ~20 s and a
+    compiled CUDA context.
+    """
     vram = float(GPU_VRAM_GB)
     if vram >= 40:
-        CFG.batch_size, CFG.max_line_width = 48, 3200
+        CFG.batch_size, CFG.max_line_width = 24, 2560
         CFG.dataloader_workers, CFG.infer_batch = 4, 32
     elif vram >= 22:
-        CFG.batch_size, CFG.max_line_width = 24, 2560
+        CFG.batch_size, CFG.max_line_width = 16, 2560
         CFG.dataloader_workers, CFG.infer_batch = 4, 24
     elif vram >= 14:
-        CFG.batch_size, CFG.max_line_width = 12, 2560
+        CFG.batch_size, CFG.max_line_width = 8, 2560
         CFG.dataloader_workers, CFG.infer_batch = 2, 16
     else:
         CFG.batch_size, CFG.max_line_width = 4, 1920
@@ -339,3 +347,180 @@ class Notifier:
 NOTIFY = Notifier(CFG)
 NOTIFY.install_crash_handler()
 NOTIFY.run_started()
+
+# %% [markdown]
+# ### 2.2 Hub and TensorBoard
+#
+# Same contract as the Qwen notebook. `HF_REPO_ID` + `HF_TOKEN` in `.env` mirror
+# fold weights, TensorBoard event files and the two submission CSVs. An empty
+# `hf_repo_id` is a no-op. A hub failure never kills training.
+#
+# ketos itself writes Lightning scalars when `--logger tensorboard` is set; we
+# also log OOF score/CER/WER after each fold. View locally with
+# `tensorboard --logdir artifacts_kraken/runs --port 6006`, or on the Hub
+# Training metrics tab once a `runs/` folder has been pushed.
+
+# %%
+class HubSync:
+    """Failure-tolerant Hugging Face uploads. Never raises into training."""
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.repo_id = (cfg.hf_repo_id or "").strip()
+        self.api = None
+        self.enabled = False
+        if not self.repo_id:
+            print("[hub] disabled (CFG.hf_repo_id / HF_REPO_ID is empty)")
+            return
+        token = os.environ.get(cfg.hf_token_env) or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        try:
+            from huggingface_hub import HfApi
+            self.api = HfApi(token=token)
+            who = self.api.whoami()["name"]
+            self.api.create_repo(self.repo_id, private=cfg.hf_private,
+                                 exist_ok=True, repo_type="model")
+            self.enabled = True
+            print(f"[hub] {who} -> {self.repo_id} "
+                  f"({'private' if cfg.hf_private else 'public'})")
+        except Exception as exc:
+            print(f"[hub] disabled: {type(exc).__name__}: {exc}")
+
+    def _guard(self, what: str, fn, *args, **kwargs):
+        if not self.enabled:
+            return None
+        try:
+            return fn(*args, **kwargs)
+        except Exception as exc:
+            print(f"[hub] FAILED {what}: {type(exc).__name__}: {exc}")
+            return None
+
+    def push_folder(self, local: Path, path_in_repo: str, message: str = "") -> bool:
+        local = Path(local)
+        if not self.enabled or not local.exists():
+            return False
+        size = sum(f.stat().st_size for f in local.rglob("*") if f.is_file()) / 1e6
+        print(f"[hub] uploading {path_in_repo} ({size:.0f} MB)")
+        return self._guard(f"upload {path_in_repo}", self.api.upload_folder,
+                           folder_path=str(local), path_in_repo=path_in_repo,
+                           repo_id=self.repo_id, repo_type="model",
+                           commit_message=message or f"add {path_in_repo}") is not None
+
+    def push_file(self, local: Path, path_in_repo: str | None = None,
+                  message: str = "") -> bool:
+        local = Path(local)
+        if not self.enabled or not local.exists():
+            return False
+        return self._guard(f"upload {local.name}", self.api.upload_file,
+                           path_or_fileobj=str(local),
+                           path_in_repo=path_in_repo or local.name,
+                           repo_id=self.repo_id, repo_type="model",
+                           commit_message=message or f"add {local.name}") is not None
+
+    def write_card(self, body: str) -> None:
+        if not self.enabled:
+            return
+        card = OUT / "README_hub.md"
+        card.write_text(body, encoding="utf-8")
+        self.push_file(card, "README.md", "update model card")
+
+
+class TBLogger:
+    root = OUT / "runs"
+
+    def __init__(self, tag: str, enabled: bool = True):
+        self.tag, self.writer = tag, None
+        self.dir = self.root / tag
+        if not enabled:
+            return
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            self.dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=str(self.dir))
+        except Exception as exc:
+            print(f"[tb] disabled ({type(exc).__name__}: {exc})")
+
+    def scalar(self, name: str, value, step: int) -> None:
+        if self.writer is None or value is None:
+            return
+        try:
+            self.writer.add_scalar(name, float(value), int(step))
+        except Exception:
+            pass
+
+    def flush(self) -> None:
+        if self.writer is not None:
+            try:
+                self.writer.flush()
+            except Exception:
+                pass
+
+    def close(self) -> None:
+        self.flush()
+        if self.writer is not None:
+            try:
+                self.writer.close()
+            except Exception:
+                pass
+            self.writer = None
+
+
+def ketos_tb_dir(tag: str) -> Path:
+    d = TBLogger.root / tag
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def log_ketos_val_curve(tag: str, log_txt: str) -> None:
+    """Scrape ketos validation 'errors / total chars' into TensorBoard."""
+    tb = TBLogger(tag, CFG.tensorboard)
+    chars, step = None, 0
+    for line in log_txt.splitlines():
+        m = re.search(r"total chars\s+([\d.]+)", line)
+        if m:
+            chars = float(m.group(1))
+        m = re.search(r"errors\s+([\d.]+)", line)
+        if m and chars:
+            cer = float(m.group(1)) / max(chars, 1.0)
+            tb.scalar("ketos/val_cer", cer, step)
+            tb.scalar("ketos/val_acc", 1.0 - cer, step)
+            step += 1
+    tb.close()
+
+
+def kraken_model_card(scores: dict | None = None) -> str:
+    score_lines = "".join(f"- **{k}**: {v}\n" for k, v in (scores or {}).items())
+    return f"""---
+license: apache-2.0
+base_model: {CFG.model_id}
+tags:
+  - handwritten-text-recognition
+  - ocr
+  - kraken
+  - ppocrv6
+library_name: kraken
+---
+
+# R.O.A.D. Barbados — Kraken PP-OCRv6
+
+Fine-tune of [`{CFG.model_id}`](https://huggingface.co/{CFG.model_id}) on the
+challenge's own `Train.csv` line crops. Weights only; images are not redistributed.
+
+## Results
+
+{score_lines or "_written when the run completes_"}
+
+- run id: `{RUN_FINGERPRINT.get("run_id")}`
+- folds: `{list(CFG.train_folds)}`
+- resize: `{CFG.resize}`
+- epochs: `{CFG.epochs}` `{CFG.quit}`
+- batch / max_width: `{CFG.batch_size}` / `{CFG.max_line_width}`
+"""
+
+
+HUB = HubSync(CFG)
+TBLogger.root.mkdir(parents=True, exist_ok=True)
+print(f"[tb] {'enabled' if CFG.tensorboard else 'disabled'} -> {TBLogger.root}")
+print(f"[tb] tensorboard --logdir {TBLogger.root} --port 6006")
+if CFG.hf_repo_id:
+    print(f"[tb] hub tab  https://huggingface.co/{CFG.hf_repo_id}/tensorboard")
+

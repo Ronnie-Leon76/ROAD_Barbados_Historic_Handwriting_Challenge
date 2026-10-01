@@ -14,12 +14,22 @@
 # | `post_config.json` | after tuning | the fusion weights, which move the score by more than a training epoch |
 # | `submission.csv`, `run_manifest.json` | at the end | the exact rows that were scored |
 #
-# Going the other way, `CFG.hf_resume = True` pulls the checkpoints back down and
-# skips training entirely, which turns a four-hour run into a decoding-only pass —
-# useful for re-tuning post-processing without paying for the GPU hours again.
+# Going the other way, `CFG.hf_resume = True` pulls existing checkpoints (and
+# Section 14 pulls `preds/**`) so `RUN_PLAN` can skip tags that already exist and
+# only train the missing voters.
 #
-# Nothing here is required: with `hf_repo_id` empty every call is a no-op and the
-# notebook behaves exactly as before.
+# Export `$HF_TOKEN` in the pod environment; do not paste it into a cell.
+
+# %%
+# Never paste a token into this cell. Export HF_TOKEN in the pod env or .env.
+assert os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") \
+    or os.environ.get("ROAD_HEADLESS") == "1", \
+    "export HF_TOKEN in the pod env / .env first"
+# The trained fold0 adapter lives here (val 0.90477 @ step 532). A different
+# HF_REPO_ID in .env would resume from an empty/wrong repo.
+CFG.hf_repo_id = "Ronochieng/road-barbados-htr"
+CFG.hf_resume = True     # pull fold0_seed42 (and preds) instead of retraining it
+print(f"[hub] repo={CFG.hf_repo_id}  resume={CFG.hf_resume}")
 
 # %%
 class HubSync:

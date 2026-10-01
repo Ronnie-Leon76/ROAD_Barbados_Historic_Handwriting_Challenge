@@ -4,15 +4,33 @@
 # One object controls the whole run. Defaults are auto-scaled to the detected GPU:
 # an 8B backbone in bf16 on >= 40 GB cards, a 4B backbone or 4-bit QLoRA on smaller
 # ones. Every downstream cell reads from `CFG`, so a single edit here is enough to
-# change the experiment.
+# change the experiment. Session knobs go in the `CLI_OVERRIDES` cell immediately
+# below; `run_pipeline.py --set` merges on top of them.
 #
 # Three switches change the shape of the run rather than a hyperparameter:
 #
 # | Switch | Effect |
 # |---|---|
+# | `competition_mode` | **Leaderboard recipe**: all five folds + the kraken CTC branch. `--fast` and `--folds` still override it |
 # | `finetune_mode` | `"lora"` adapters (default) or `"full"` — every weight trained, with the learning rate, optimiser, batch shape and EMA re-derived to match |
-# | `run_grpo` | RL polish that optimises the leaderboard metric directly, kept only if it beats the SFT adapter out-of-fold |
+# | `run_grpo` | RL polish on the leaderboard metric. Off by default: with this data the 6 samples/image are nearly identical, so the advantages are noise |
 # | `hf_repo_id` | mirrors every checkpoint and artefact to the Hugging Face Hub so the run can be replayed exactly |
+
+# %%
+# Session knobs. argparse / `run_pipeline.py --set` merge on top (CLI wins).
+# Resolution is commented out on purpose: CACHE_DIR is computed once at import
+# from CFG.line_height / max_line_width, so a high-res run needs its own session.
+CLI_OVERRIDES = {
+    **dict(
+        run_grpo=False,
+        # --- high-res variant: run in its OWN session (cache dir is fixed at import) ---
+        # line_height=192, max_line_width=3840,
+        # per_device_batch_size=4, grad_accum=8,   # same effective batch of 32, avoids OOM
+        # --- only after the view ablation (Section 15) says dark/light add nothing ---
+        # tta_photometric=False,
+    ),
+    **globals().get("CLI_OVERRIDES", {}),
+}
 
 # %%
 def load_dotenv(path: str | Path = ".env") -> list:
@@ -78,7 +96,11 @@ class Config:
 
     # --------------------------------------------------------------- splits --
     n_folds: int = 5
-    train_folds: tuple = (0,)              # which folds to actually train
+    # One fold is a plumbing check (the 0.905 public score). A leaderboard run
+    # needs every fold: that is the largest unused lever in this pipeline.
+    train_folds: tuple = (0,)
+    competition_mode: bool = True          # True -> all n_folds + CTC branch
+                                           # (--fast / CLI --folds still win)
     fold_seed: int = 20260703
 
     # ------------------------------------------------------------- training --
@@ -164,10 +186,10 @@ class Config:
     lm_tune_iters: int = 400
 
     # ------------------------------------------------------- optional stages --
-    # GRPO optimises the leaderboard metric directly. It is on, but gated: the
-    # polished adapter is scored against the SFT one on held-out data and is only
-    # kept if it wins, so enabling it cannot make the submission worse.
-    run_grpo: bool = True
+    # GRPO optimises the leaderboard metric directly. It is off: on this data the
+    # 6 samples per image are nearly identical (reward_std ~0.02–0.04), so the
+    # advantages are noise. Re-enable only if the verdict tab shows a real gain.
+    run_grpo: bool = False
     grpo_steps: int = 300
     grpo_num_generations: int = 6
     grpo_lr: float = 2e-6
@@ -176,6 +198,35 @@ class Config:
     grpo_keep_if_better: bool = True       # revert to the SFT adapter when it loses
     grpo_eval_samples: int = 320
     use_pseudo_labels: bool = False        # OFF pending an organiser ruling
+
+    # ------------------------------------------------- kraken CTC branch --
+    # A second, architecturally different recogniser: kraken's PP-OCRv6 port, a
+    # 15.9M-parameter CTC line model (Apache-2.0), fine-tuned per fold on the same
+    # lines. CTC cannot loop or invent text the way an autoregressive decoder can,
+    # so it is used as an independent ROVER member and as an anchor that
+    # penalises VLM hypotheses which drift away from what is on the page. Section
+    # 15 tunes the fusion with and without it and keeps it only if it wins
+    # out-of-fold - enabling it cannot make the submission worse. See Section 14.1.
+    ctc_branch: bool = True
+    ctc_model_id: str = "small-models-for-glam/kraken-ppocrv6-medium"
+    ctc_model_file: str = "medium.safetensors"
+    ctc_kraken_version: str = "7.1.1"      # first release that trains ppocrv6
+    ctc_venv: str = ".venv_kraken"         # isolated: kraken pins torch/scipy/sklearn
+    ctc_torch_index: str = "https://download.pytorch.org/whl/cu126"
+    ctc_finetune: bool = True              # False = zero-shot base model only
+    ctc_folds: tuple = ()                  # () -> every fold; ~minutes each
+    ctc_epochs: int = 40
+    ctc_lr: float = 3e-4                   # base recipe used 1.05e-3 from scratch
+    ctc_warmup: int = 200                  # steps
+    ctc_batch_size: int = 32
+    ctc_line_height: int = 128             # the medium model's input height
+    # ketos height-normalises every line to ctc_line_height and silently DROPS
+    # training lines wider than --max-width afterwards; batches are padded to it.
+    # 0 = derive it from the data so no line is lost (Section 14.1 prints it).
+    ctc_max_width: int = 0
+    ctc_augment: bool = True
+    ctc_tta_modes: tuple = ("identity", "dark", "light")
+    ctc_infer_batch: int = 64
 
     # ------------------------------------------------------------ hugging face --
     # Set hf_repo_id to something like "your-name/road-barbados-htr" and export a
@@ -286,6 +337,10 @@ def apply_finetune_mode(cfg: Config, vram_gb: float) -> Config:
 # then win over them, and the mode/quantisation derivations run last so they see
 # the settings that will actually be used.
 CFG = autoscale(CFG, GPU_VRAM_GB)
+if CFG.competition_mode:
+    CFG.train_folds = tuple(range(CFG.n_folds))
+    CFG.ctc_branch = True
+    print(f"[cfg] COMPETITION MODE: CTC on folds {CFG.train_folds}; VLM runs follow RUN_PLAN")
 if not CFG.hf_repo_id:
     CFG.hf_repo_id = os.environ.get("HF_REPO_ID", "").strip()
 
@@ -351,6 +406,10 @@ KNOWN_LICENCES = {
     "microsoft/Florence-2-large": ("mit", True),
     "stepfun-ai/GOT-OCR2_0": ("apache-2.0", True),
     "allenai/olmOCR-7B-0225-preview": ("apache-2.0", True),
+    # kraken PP-OCRv6 ports (CTC line recognisers, Section 14.1). Verified 2026-09.
+    "small-models-for-glam/kraken-ppocrv6-medium": ("apache-2.0", True),
+    "small-models-for-glam/kraken-ppocrv6-small": ("apache-2.0", True),
+    "small-models-for-glam/kraken-ppocrv6-tiny": ("apache-2.0", True),
     # --- blocked ---
     "Qwen/Qwen2.5-VL-3B-Instruct": ("qwen-research", False),
     "stanford-oval/churro-3B": ("qwen-research", False),
@@ -397,3 +456,4 @@ def check_licence(model_id: str, strict: bool = True) -> str:
 
 
 CFG_LICENCE = check_licence(CFG.model_id)
+CTC_LICENCE = check_licence(CFG.ctc_model_id) if CFG.ctc_branch else None

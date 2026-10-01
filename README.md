@@ -5,6 +5,9 @@ crops. It ships in two forms, built from the same source cells so they cannot dr
 
 - [`ROAD_Barbados_HTR_SOTA.ipynb`](ROAD_Barbados_HTR_SOTA.ipynb) — the interactive
   deliverable, with the diagnostics and plots inline.
+- [`ROAD_Barbados_Kraken_PP_OCRv6.ipynb`](ROAD_Barbados_Kraken_PP_OCRv6.ipynb) — a
+  **separate** Kraken-first notebook (fresh kernel). Fine-tunes the 15.9 M PP-OCRv6
+  line model on all five folds and optionally ensembles the Qwen submission.
 - `run_pipeline.py` — a headless script for unattended runs, generated with
   `python build/build_script.py`.
 
@@ -12,7 +15,10 @@ crops. It ships in two forms, built from the same source cells so they cannot dr
 
 A LoRA fine-tune of an Apache-2.0 vision-language model on the challenge's own line
 images, decoded with beam search plus multi-scale test-time augmentation, and fused
-across folds with ROVER voting, character n-gram rescoring and lexicon repair.
+across folds with ROVER voting, character n-gram rescoring and lexicon repair. A
+second, much smaller recogniser — kraken's PP-OCRv6 CTC model — is fine-tuned on the
+same lines and joins the fusion as an independent voter, kept only if it wins
+out-of-fold.
 
 | Stage | Section | Summary |
 |---|---|---|
@@ -30,7 +36,8 @@ across folds with ROVER voting, character n-gram rescoring and lexicon repair.
 | Training | 8–12 | bf16 LoRA **or full fine-tune**, cosine annealing with warm-up and floor, NEFTune, adapter EMA, generation-based checkpoint selection |
 | GRPO | 13 | RL stage optimising the competition metric directly, kept only if it beats its parent out-of-fold |
 | Decoding | 14 | Batched beam search producing N-best lists with sequence scores |
-| Fusion | 15 | ROVER + rescoring + lexicon repair, all tuned out-of-fold |
+| CTC member | 14.1 | kraken PP-OCRv6 (15.9M params, Apache-2.0) fine-tuned per fold in an isolated venv; zero-shot and fine-tuned scores reported |
+| Fusion | 15 | ROVER + rescoring + lexicon repair, tuned out-of-fold twice (VLM only, VLM + CTC) with the better set kept |
 | Submission | 16–18 | `submission.csv` plus a run manifest and a "what to try next" list |
 
 ## The three switches that change the shape of a run
@@ -48,6 +55,61 @@ run on 4-bit weights, and prints a VRAM estimate against the detected card. On 3
 lines per fold LoRA is usually the better model, but the two make different mistakes,
 so a full-fine-tuned 4B fold is a strong extra member in the ROVER vote.
 
+## The kraken CTC member
+
+The [BHL OCR leaderboard](https://huggingface.co/spaces/finebooks/bhl-ocr-leaderboard)
+(2026-09-03) found kraken's 15.9M-parameter PP-OCRv6 port reading 18th–19th-century
+book pages on a par with VLMs hundreds of times larger: reading CER .034 [.024–.044]
+vs .051 [.029–.077] for Qwen3.5-9B, and no looped pages at all (Qwen: 1.5 %).
+
+That is evidence for adding it, not for swapping the VLM out:
+
+* the board is **zero-shot on printed books**; this challenge is **fine-tuned on
+  handwriting**, where the VLM has 3 300 in-domain lines to learn from;
+* the reading-CER intervals **overlap**, which the board itself calls noise — the
+  differences outside noise are the failure modes (loops, invented text on sparse
+  lines), which CTC cannot produce by construction;
+* two architectures make different mistakes, which is what ROVER turns into accuracy.
+
+So Section 14.1 fine-tunes it per fold (minutes each), decodes with photometric TTA,
+and gives Section 15 two things: extra hypotheses, and a `c_sim` feature measuring how
+far each VLM hypothesis is from what the CTC model read. Section 15 tunes the fusion
+with and without it and keeps whichever scores higher out-of-fold. The run summary
+prints the zero-shot score on *our* lines, the fine-tuned score and the gate verdict,
+so whether the leaderboard result transfers is measured rather than assumed.
+
+kraken 7.1 pins `torch>=2.9`, `scipy~=1.15` and `scikit-learn~=1.7`, so it is
+installed into its own virtualenv (`.venv_kraken`, ~3 GB on first run) and driven by
+subprocess. If anything in that branch fails, the run emails you and continues
+VLM-only. Switch it off with `--no-ctc` or `CFG.ctc_branch = False`; set
+`CFG.ctc_torch_index` if your driver needs a different CUDA wheel than cu126.
+
+## Kraken-first notebook (`ROAD_Barbados_Kraken_PP_OCRv6.ipynb`)
+
+The Qwen LoRA run on one fold scored **0.90491 OOF / 0.90485 public**. First place
+is **0.9399**. GRPO added `+0.00041`. That is a recogniser gap, not a fusion gap.
+
+`ROAD_Barbados_Kraken_PP_OCRv6.ipynb` is a **separate kernel**: do not run it
+inside the Qwen environment (kraken 7.1 wants `torch>=2.9`). **Run All** on a
+PyTorch ≥ 2.9 image. The notebook pins `click<8.3` with `huggingface_hub<2`,
+trains PP-OCRv6 with `-q fixed` (no `--freeze-backbone`), sizes batch and
+`--max-width` to the card (L40S → batch 24 / width 2560), and rewrites line
+PNGs so ketos does not stall the GPU on `Failed. Replacing with sample`.
+
+Crops are treated as **one line** — the starter-kit page segmenter is the wrong
+tool. If `submission_road_htr.csv` (the Qwen file) is next to the notebook it is
+blended at test time, but only when the two strings are close.
+
+Resume is automatic under `artifacts_kraken/`. Delete a fold's `models/` directory
+only if that fold crashed.
+
+```bash
+python build/build_notebook.py --parts build/kraken_parts --out ROAD_Barbados_Kraken_PP_OCRv6.ipynb
+```
+
+Output: `submission_kraken.csv` and, when the Qwen file is present,
+`submission_ensemble.csv`. Submit both; keep whichever the public board prefers.
+
 ## Running it
 
 1. Rent a GPU with **at least 40 GB** of VRAM (L40S, A100, H100) on a PyTorch ≥ 2.6
@@ -55,7 +117,11 @@ so a full-fine-tuned 4B fold is a strong extra member in the ROVER vote.
    cards, but the 8B configuration is what the defaults target.
 2. Put `Train.csv`, `Test.csv` and `SampleSubmission.csv` next to the notebook.
    `images.zip` is downloaded automatically on first run.
-3. Run all cells. With the default `CFG.train_folds = (0,)` a full pass takes roughly
+3. Run all cells.  Section 1 installs its own dependencies, so nothing is needed
+   beforehand. Outside the notebook — for `run_pipeline.py`, or to build the image
+   for a pod — use `pip install -r requirements.txt`. PyTorch is not in that file
+   on purpose: the right wheel depends on your CUDA version, and every GPU image
+   already ships one. With the default `CFG.train_folds = (0,)` a full pass takes roughly
    two hours end to end.
 4. For a competitive submission set `CFG.train_folds = (0, 1, 2, 3, 4)` and re-run —
    ensembling across folds is the single most reliable improvement in the pipeline.
@@ -85,6 +151,8 @@ python run_pipeline.py --resume-from-hub           # decode a previous run, no t
 python run_pipeline.py --set lora_r=64 --set line_height=192
 python run_pipeline.py --install                   # first launch on a fresh pod
 python run_pipeline.py --progress-interval 5       # chattier progress bars in the log
+python run_pipeline.py --no-ctc                    # skip the kraken CTC member
+python run_pipeline.py --set ctc_epochs=80         # longer CTC fine-tune
 ```
 
 `--set FIELD=VALUE` reaches any field on `CFG` and is validated against the dataclass,
@@ -164,6 +232,8 @@ The organisers' discussion-board rulings are enforced rather than assumed:
   the Hugging Face API and raises on anything outside the allow-list, which is why
   `Qwen2.5-VL-3B-Instruct` (`qwen-research`) and `churro-3B` are blocked while
   `Qwen3-VL-8B-Instruct` and `Qwen2.5-VL-7B-Instruct` (both Apache-2.0) are allowed.
+  The kraken member (`small-models-for-glam/kraken-ppocrv6-medium`) is Apache-2.0 and
+  passes through the same guard.
 * **StackMix.** Explicitly permitted as training-data augmentation. Only `Train.csv`
   images are segmented, the whole process is code-driven and seeded, and labels are
   the concatenation of the source words.
@@ -175,16 +245,21 @@ The organisers' discussion-board rulings are enforced rather than assumed:
 
 ```
 ROAD_Barbados_HTR_SOTA.ipynb   generated notebook — the interactive deliverable
+ROAD_Barbados_Kraken_PP_OCRv6.ipynb  Kraken-first notebook (fresh kernel)
 run_pipeline.py                generated script — the unattended deliverable
 run_background.sh / .ps1       detached launcher
+requirements.txt               pins for a non-notebook environment (no torch)
 .env / .env.example            secrets (gitignored) and their template
 build/parts/p*.py              source cells, jupytext "percent" format, in run order
+build/kraken_parts/k*.py       source cells for the Kraken notebook
 build/build_notebook.py        parts -> .ipynb
 build/build_script.py          parts -> run_pipeline.py
 build/selftest.py              CPU test of the GPU-free half of the pipeline
 build/check_notifications.py   SMTP preflight
 build/proto_segment.py         standalone word-segmentation experiment
+.venv_kraken/                  isolated kraken env, created on first run (gitignore it)
 artifacts/                     EDA plots, checkpoints, predictions, TensorBoard runs
+artifacts_kraken/              Kraken-notebook outputs
 logs/                          timestamped output from background runs
 ```
 
@@ -198,4 +273,6 @@ python build/selftest.py          # ~4 minutes, needs the data present
 
 `selftest.py` runs the data, metric, split, image, StackMix and fusion sections
 against the real images on CPU, and checks the metric, ROVER, character LM and
-lexicon repair against known-answer cases.
+lexicon repair against known-answer cases. It also asserts that `requirements.txt`
+and the notebook's install cell list exactly the same packages, so the two cannot
+drift apart unnoticed.

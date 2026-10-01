@@ -12,6 +12,7 @@ Examples:
     python run_pipeline.py --folds 0 1 2 3 4 --epochs 5
     python run_pipeline.py --mode full --model Qwen/Qwen3-VL-4B-Instruct
     python run_pipeline.py --hf-repo me/road-htr --no-grpo
+    python run_pipeline.py --no-ctc                         # VLM only
     python run_pipeline.py --set lora_r=64 --set line_height=192
 
 Background:
@@ -63,6 +64,8 @@ def _args():
     ap.add_argument("--grpo", dest="grpo", action="store_true", default=None)
     ap.add_argument("--no-grpo", dest="grpo", action="store_false")
     ap.add_argument("--no-stackmix", dest="stackmix", action="store_false", default=None)
+    ap.add_argument("--no-ctc", dest="ctc", action="store_false", default=None,
+                    help="skip the kraken PP-OCRv6 CTC member (Section 14.1)")
     ap.add_argument("--no-tensorboard", dest="tensorboard", action="store_false",
                     default=None)
     ap.add_argument("--no-email", dest="notify", action="store_false", default=None)
@@ -191,7 +194,8 @@ if ARGS.folds is not None:
 for flag, field in (("mode", "finetune_mode"), ("model", "model_id"),
                     ("epochs", "epochs"), ("lr", "lr"), ("seed", "seed"),
                     ("hf_repo", "hf_repo_id"), ("grpo", "run_grpo"),
-                    ("stackmix", "stackmix"), ("tensorboard", "tensorboard"),
+                    ("stackmix", "stackmix"), ("ctc", "ctc_branch"),
+                    ("tensorboard", "tensorboard"),
                     ("notify", "notify_email")):
     value = getattr(ARGS, flag, None)
     if value is not None:
@@ -201,7 +205,9 @@ if ARGS.resume_from_hub:
 if ARGS.fast:
     CLI_OVERRIDES.update({"train_folds": (0,), "epochs": 1.0, "num_beams": 1,
                           "n_best": 1, "tta_scales": (1.0,), "tta_photometric": False,
-                          "run_grpo": False, "eval_max_samples": 64})
+                          "run_grpo": False, "eval_max_samples": 64,
+                          "ctc_folds": (0,), "ctc_epochs": 2,
+                          "ctc_tta_modes": ("identity",)})
 for item in ARGS.set:
     if "=" not in item:
         raise SystemExit(f"--set expects FIELD=VALUE, got {item!r}")
@@ -248,15 +254,20 @@ if ARGS.email:
 # 6. **GRPO stage** that optimises the competition metric directly as a reward on top
 #    of the SFT checkpoint. On by default and self-gating: the polished weights are
 #    scored against their parent on held-out data and discarded unless they win.
-# 7. **Reproducibility and checkpoint custody**: deterministic kernels, per-sample
+# 7. **A second, CTC recogniser**: kraken's PP-OCRv6 port (15.9M parameters,
+#    Apache-2.0) fine-tuned per fold in its own virtualenv. It cannot loop or
+#    hallucinate the way an autoregressive decoder can, so it joins the ROVER vote
+#    and anchors the rescoring — and, like GRPO, it is kept only if it wins
+#    out-of-fold (`Section 14.1`).
+# 8. **Reproducibility and checkpoint custody**: deterministic kernels, per-sample
 #    seeding, a run fingerprint over the input files and library versions, and
 #    optional mirroring of every checkpoint and artefact to the Hugging Face Hub —
 #    so a run can be replayed, or resumed on a fresh pod, to the same score.
-# 8. **Unattended operation**: the same cells build `run_pipeline.py`, a headless
+# 9. **Unattended operation**: the same cells build `run_pipeline.py`, a headless
 #    script that logs to file, streams TensorBoard curves (locally and to the hub),
 #    and emails you on every checkpoint upload, GRPO verdict, completion and
 #    failure. See `python build/build_script.py` and `./run_background.sh`.
-# 9. **Legible progress**: stage banners with elapsed wall clock, a `tqdm` bar on
+# 10. **Legible progress**: stage banners with elapsed wall clock, a `tqdm` bar on
 #    every long loop and a training heartbeat with a projected finish time — throttled
 #    automatically when the output is a log file rather than a terminal (`Section 2.6`).
 #
@@ -266,6 +277,15 @@ if ARGS.email:
 # longer references carry more weight. The metric is re-implemented in
 # `Section 4` and unit-tested, so local validation numbers are directly comparable
 # to the leaderboard.
+#
+# ## How to actually win (read this before training another 8B fold-0)
+#
+# The 0.905 public score trained **one fold**. GRPO added 0.0004. First place is
+# 0.940. Do not swap to dots.ocr (custom licence) or chase another VLM from the
+# BHL printed-book board. Set `CFG.competition_mode = True` (the default): all
+# five folds of this Qwen pipeline **and** the kraken CTC branch. Then run
+# `ROAD_Barbados_Kraken_PP_OCRv6.ipynb` on a **separate** kernel and submit
+# both files plus the ensemble. Email alerts fire in both notebooks from `.env`.
 
 # ## 0. Rules compliance — read before changing model or data settings
 #
@@ -289,16 +309,14 @@ if ARGS.email:
 #
 # On RunPod choose a **PyTorch 2.6+ / CUDA 12.4+** template. If the base image ships
 # an older torch, the cell prints a warning instead of silently producing a broken
-# environment.
+# environment. FlashAttention-2 is installed from a prebuilt wheel with the pip
+# cache disabled so a `/tmp` vs `/workspace` split cannot raise EXDEV; if no
+# matching wheel exists the model falls back to SDPA and training still runs.
 #
-# To mirror checkpoints to the Hugging Face Hub, set a **write** token before running
-# `Section 2.3` — on RunPod the cleanest way is a pod secret, so the token never
-# reaches the notebook file:
-#
-# ```python
-# import os; os.environ["HF_TOKEN"] = "hf_..."   # or set it in the pod environment
-# CFG.hf_repo_id = "your-name/road-barbados-htr"
-# ```
+# To mirror checkpoints to the Hugging Face Hub, export a **write** token in the
+# pod environment (or gitignored `.env`) *before* running `Section 2.3`. Do not
+# paste it into a notebook cell — that is how tokens end up in checkpoints and
+# git history. Section 2.3 asserts the token is present and sets the repo id.
 
 import os as _os
 
@@ -311,10 +329,18 @@ INSTALL_FLASH_ATTENTION = RUN_INSTALL   # falls back to SDPA if the wheel fails
 if RUN_INSTALL:
     import subprocess
     import sys
+    from pathlib import Path
 
-    def pip(*args: str) -> None:
+    def pip(*args: str, extra_env: dict | None = None, cwd: str | None = None) -> int:
         print("pip", *args)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args], check=False)
+        env = None
+        if extra_env:
+            env = _os.environ.copy()
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *args],
+            check=False, env=env, cwd=cwd,
+        ).returncode
 
     pip("--upgrade", "pip")
     pip(
@@ -341,9 +367,80 @@ if RUN_INSTALL:
         "pyyaml",
         "tensorboard>=2.16",
     )
+
+    def _flash_attn_ok() -> bool:
+        try:
+            import flash_attn  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _download_flash_attn_wheel(dest_dir: Path) -> Path | None:
+        """Fetch the same GitHub wheel flash-attn's setup.py would have guessed."""
+        try:
+            import torch
+            import urllib.request
+        except Exception:
+            return None
+        if sys.platform != "linux":
+            return None
+        py = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        torch_mm = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+        try:
+            abi = "TRUE" if bool(torch._C._GLIBCXX_USE_CXX11_ABI) else "FALSE"
+        except Exception:
+            abi = "TRUE"
+        for ver in ("2.8.3.post1", "2.8.3", "2.8.2", "2.7.4.post1", "2.7.3"):
+            name = (f"flash_attn-{ver}+cu12torch{torch_mm}cxx11abi{abi}"
+                    f"-{py}-{py}-linux_x86_64.whl")
+            url = ("https://github.com/Dao-AILab/flash-attention/releases/"
+                   f"download/v{ver}/{name}")
+            path = dest_dir / name.replace("+", "-")
+            print(f"[env] trying {url}")
+            try:
+                urllib.request.urlretrieve(url, path)
+                if path.stat().st_size > 1_000_000:
+                    return path
+            except Exception as exc:
+                print(f"[env]   {exc}")
+            path.unlink(missing_ok=True)
+        return None
+
+    def install_flash_attn() -> None:
+        """Install a prebuilt wheel without crossing filesystems.
+
+        flash-attn downloads a matching GitHub wheel, then pip `os.rename`s it
+        into its cache. On rented pods /tmp and /workspace are often different
+        mounts, which raises EXDEV (errno 18) and looks like a failed source
+        build even though a good wheel was just fetched. Keep temp files on the
+        workspace, skip the pip wheel cache, and never fall through to a CUDA
+        compile (~40 minutes on a pod).
+        """
+        if _flash_attn_ok():
+            print("[env] flash-attn already installed")
+            return
+        root = Path.cwd() / ".cache"
+        tmp = root / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        env = {
+            "TMPDIR": str(tmp), "TEMP": str(tmp), "TMP": str(tmp),
+            "FLASH_ATTENTION_SKIP_CUDA_BUILD": "TRUE",
+        }
+        rc = pip("flash-attn>=2.7.0", "--no-build-isolation", "--no-cache-dir",
+                 extra_env=env, cwd=str(tmp))
+        if rc == 0 or _flash_attn_ok():
+            print("[env] flash-attn installed")
+            return
+        wheel = _download_flash_attn_wheel(tmp)
+        if wheel is not None and (pip(str(wheel), extra_env=env, cwd=str(tmp)) == 0
+                                  or _flash_attn_ok()):
+            print(f"[env] flash-attn installed from {wheel.name}")
+            return
+        print("[env] flash-attn unavailable; attention will use SDPA. "
+              "Training still runs, just uses more VRAM per step.")
+
     if INSTALL_FLASH_ATTENTION:
-        # Prebuilt wheels only; a source build on a rented pod costs ~40 minutes.
-        pip("flash-attn>=2.7.0", "--no-build-isolation")
+        install_flash_attn()
 
 import gc
 import json
@@ -430,15 +527,32 @@ def vram_report(tag: str = "") -> None:
 # One object controls the whole run. Defaults are auto-scaled to the detected GPU:
 # an 8B backbone in bf16 on >= 40 GB cards, a 4B backbone or 4-bit QLoRA on smaller
 # ones. Every downstream cell reads from `CFG`, so a single edit here is enough to
-# change the experiment.
+# change the experiment. Session knobs go in the `CLI_OVERRIDES` cell immediately
+# below; `run_pipeline.py --set` merges on top of them.
 #
 # Three switches change the shape of the run rather than a hyperparameter:
 #
 # | Switch | Effect |
 # |---|---|
+# | `competition_mode` | **Leaderboard recipe**: all five folds + the kraken CTC branch. `--fast` and `--folds` still override it |
 # | `finetune_mode` | `"lora"` adapters (default) or `"full"` — every weight trained, with the learning rate, optimiser, batch shape and EMA re-derived to match |
-# | `run_grpo` | RL polish that optimises the leaderboard metric directly, kept only if it beats the SFT adapter out-of-fold |
+# | `run_grpo` | RL polish on the leaderboard metric. Off by default: with this data the 6 samples/image are nearly identical, so the advantages are noise |
 # | `hf_repo_id` | mirrors every checkpoint and artefact to the Hugging Face Hub so the run can be replayed exactly |
+
+# Session knobs. argparse / `run_pipeline.py --set` merge on top (CLI wins).
+# Resolution is commented out on purpose: CACHE_DIR is computed once at import
+# from CFG.line_height / max_line_width, so a high-res run needs its own session.
+CLI_OVERRIDES = {
+    **dict(
+        run_grpo=False,
+        # --- high-res variant: run in its OWN session (cache dir is fixed at import) ---
+        # line_height=192, max_line_width=3840,
+        # per_device_batch_size=4, grad_accum=8,   # same effective batch of 32, avoids OOM
+        # --- only after the view ablation (Section 15) says dark/light add nothing ---
+        # tta_photometric=False,
+    ),
+    **globals().get("CLI_OVERRIDES", {}),
+}
 
 def load_dotenv(path: str | Path = ".env") -> list:
     """Minimal .env loader. Existing environment variables always win.
@@ -503,7 +617,11 @@ class Config:
 
     # --------------------------------------------------------------- splits --
     n_folds: int = 5
-    train_folds: tuple = (0,)              # which folds to actually train
+    # One fold is a plumbing check (the 0.905 public score). A leaderboard run
+    # needs every fold: that is the largest unused lever in this pipeline.
+    train_folds: tuple = (0,)
+    competition_mode: bool = True          # True -> all n_folds + CTC branch
+                                           # (--fast / CLI --folds still win)
     fold_seed: int = 20260703
 
     # ------------------------------------------------------------- training --
@@ -589,10 +707,10 @@ class Config:
     lm_tune_iters: int = 400
 
     # ------------------------------------------------------- optional stages --
-    # GRPO optimises the leaderboard metric directly. It is on, but gated: the
-    # polished adapter is scored against the SFT one on held-out data and is only
-    # kept if it wins, so enabling it cannot make the submission worse.
-    run_grpo: bool = True
+    # GRPO optimises the leaderboard metric directly. It is off: on this data the
+    # 6 samples per image are nearly identical (reward_std ~0.02–0.04), so the
+    # advantages are noise. Re-enable only if the verdict tab shows a real gain.
+    run_grpo: bool = False
     grpo_steps: int = 300
     grpo_num_generations: int = 6
     grpo_lr: float = 2e-6
@@ -601,6 +719,35 @@ class Config:
     grpo_keep_if_better: bool = True       # revert to the SFT adapter when it loses
     grpo_eval_samples: int = 320
     use_pseudo_labels: bool = False        # OFF pending an organiser ruling
+
+    # ------------------------------------------------- kraken CTC branch --
+    # A second, architecturally different recogniser: kraken's PP-OCRv6 port, a
+    # 15.9M-parameter CTC line model (Apache-2.0), fine-tuned per fold on the same
+    # lines. CTC cannot loop or invent text the way an autoregressive decoder can,
+    # so it is used as an independent ROVER member and as an anchor that
+    # penalises VLM hypotheses which drift away from what is on the page. Section
+    # 15 tunes the fusion with and without it and keeps it only if it wins
+    # out-of-fold - enabling it cannot make the submission worse. See Section 14.1.
+    ctc_branch: bool = True
+    ctc_model_id: str = "small-models-for-glam/kraken-ppocrv6-medium"
+    ctc_model_file: str = "medium.safetensors"
+    ctc_kraken_version: str = "7.1.1"      # first release that trains ppocrv6
+    ctc_venv: str = ".venv_kraken"         # isolated: kraken pins torch/scipy/sklearn
+    ctc_torch_index: str = "https://download.pytorch.org/whl/cu126"
+    ctc_finetune: bool = True              # False = zero-shot base model only
+    ctc_folds: tuple = ()                  # () -> every fold; ~minutes each
+    ctc_epochs: int = 40
+    ctc_lr: float = 3e-4                   # base recipe used 1.05e-3 from scratch
+    ctc_warmup: int = 200                  # steps
+    ctc_batch_size: int = 32
+    ctc_line_height: int = 128             # the medium model's input height
+    # ketos height-normalises every line to ctc_line_height and silently DROPS
+    # training lines wider than --max-width afterwards; batches are padded to it.
+    # 0 = derive it from the data so no line is lost (Section 14.1 prints it).
+    ctc_max_width: int = 0
+    ctc_augment: bool = True
+    ctc_tta_modes: tuple = ("identity", "dark", "light")
+    ctc_infer_batch: int = 64
 
     # ------------------------------------------------------------ hugging face --
     # Set hf_repo_id to something like "your-name/road-barbados-htr" and export a
@@ -711,6 +858,10 @@ def apply_finetune_mode(cfg: Config, vram_gb: float) -> Config:
 # then win over them, and the mode/quantisation derivations run last so they see
 # the settings that will actually be used.
 CFG = autoscale(CFG, GPU_VRAM_GB)
+if CFG.competition_mode:
+    CFG.train_folds = tuple(range(CFG.n_folds))
+    CFG.ctc_branch = True
+    print(f"[cfg] COMPETITION MODE: CTC on folds {CFG.train_folds}; VLM runs follow RUN_PLAN")
 if not CFG.hf_repo_id:
     CFG.hf_repo_id = os.environ.get("HF_REPO_ID", "").strip()
 
@@ -774,6 +925,10 @@ KNOWN_LICENCES = {
     "microsoft/Florence-2-large": ("mit", True),
     "stepfun-ai/GOT-OCR2_0": ("apache-2.0", True),
     "allenai/olmOCR-7B-0225-preview": ("apache-2.0", True),
+    # kraken PP-OCRv6 ports (CTC line recognisers, Section 14.1). Verified 2026-09.
+    "small-models-for-glam/kraken-ppocrv6-medium": ("apache-2.0", True),
+    "small-models-for-glam/kraken-ppocrv6-small": ("apache-2.0", True),
+    "small-models-for-glam/kraken-ppocrv6-tiny": ("apache-2.0", True),
     # --- blocked ---
     "Qwen/Qwen2.5-VL-3B-Instruct": ("qwen-research", False),
     "stanford-oval/churro-3B": ("qwen-research", False),
@@ -820,6 +975,7 @@ def check_licence(model_id: str, strict: bool = True) -> str:
 
 
 CFG_LICENCE = check_licence(CFG.model_id)
+CTC_LICENCE = check_licence(CFG.ctc_model_id) if CFG.ctc_branch else None
 
 # ==========================================================================
 # p02a_repro.py
@@ -911,7 +1067,8 @@ def build_fingerprint(cfg: Config) -> dict:
     # are excluded so that pushing to a different repo does not invalidate a match.
     volatile = {"hf_repo_id", "hf_private", "hf_push_checkpoints", "hf_push_submission",
                 "hf_resume", "hf_token_env", "work_dir", "data_dir", "out_dir",
-                "dataloader_workers", "infer_batch_size"}
+                "dataloader_workers", "infer_batch_size",
+                "ctc_venv", "ctc_torch_index", "ctc_infer_batch"}
     material = {k: v for k, v in asdict(cfg).items() if k not in volatile}
     config_hash = hashlib.sha256(
         json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()[:16]
@@ -964,12 +1121,21 @@ print("[repro] versions      " + ", ".join(
 # | `post_config.json` | after tuning | the fusion weights, which move the score by more than a training epoch |
 # | `submission.csv`, `run_manifest.json` | at the end | the exact rows that were scored |
 #
-# Going the other way, `CFG.hf_resume = True` pulls the checkpoints back down and
-# skips training entirely, which turns a four-hour run into a decoding-only pass —
-# useful for re-tuning post-processing without paying for the GPU hours again.
+# Going the other way, `CFG.hf_resume = True` pulls existing checkpoints (and
+# Section 14 pulls `preds/**`) so `RUN_PLAN` can skip tags that already exist and
+# only train the missing voters.
 #
-# Nothing here is required: with `hf_repo_id` empty every call is a no-op and the
-# notebook behaves exactly as before.
+# Export `$HF_TOKEN` in the pod environment; do not paste it into a cell.
+
+# Never paste a token into this cell. Export HF_TOKEN in the pod env or .env.
+assert os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") \
+    or os.environ.get("ROAD_HEADLESS") == "1", \
+    "export HF_TOKEN in the pod env / .env first"
+# The trained fold0 adapter lives here (val 0.90477 @ step 532). A different
+# HF_REPO_ID in .env would resume from an empty/wrong repo.
+CFG.hf_repo_id = "Ronochieng/road-barbados-htr"
+CFG.hf_resume = True     # pull fold0_seed42 (and preds) instead of retraining it
+print(f"[hub] repo={CFG.hf_repo_id}  resume={CFG.hf_resume}")
 
 class HubSync:
     """Thin, failure-tolerant wrapper around huggingface_hub uploads.
@@ -1165,7 +1331,7 @@ class Notifier:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.to = os.environ.get("NOTIFY_EMAIL_TO", "").strip()
-        self.host = os.environ.get("SMTP_HOST", "").strip()
+        self.host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
         self.port = int(os.environ.get("SMTP_PORT", "587") or 587)
         self.user = os.environ.get("SMTP_USER", "").strip()
         self.password = os.environ.get("SMTP_PASSWORD", "").strip()
@@ -3367,9 +3533,9 @@ def nbest_to_frame(nbest: dict) -> pd.DataFrame:
 # prior — and note that the two modes make *different* errors, so a LoRA fold and a
 # full-fine-tune fold fuse well together in the ROVER vote.
 #
-# The middle option, and the one worth reaching for first if LoRA looks
-# capacity-limited, is not full fine-tuning but a larger rank: `lora_r = 64` with
-# `lora_alpha = 128` roughly doubles adapter capacity for a few GB.
+# A larger rank (`lora_r = 64`) is the wrong next step on this data: training
+# reward is already ~0.98 against ~0.905 held-out, which is a generalisation gap.
+# More seeds and more labelled lines beat more adapter capacity.
 
 from transformers import Trainer, TrainingArguments, TrainerCallback
 from transformers.trainer_pt_utils import LengthGroupedSampler
@@ -3638,7 +3804,10 @@ def make_training_args(cfg: Config, out_dir: Path, steps_per_epoch: int,
 
 def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
                train_override: pd.DataFrame | None = None,
-               val_override: pd.DataFrame | None = None) -> dict:
+               val_override: pd.DataFrame | None = None,
+               adapter_path: str | Path | None = None) -> dict:
+    """Train one adapter. `adapter_path` warm-starts from an existing LoRA instead
+    of initialising a new one on the base model."""
     cfg = cfg or CFG
     tag = tag or f"fold{fold}_seed{cfg.seed}"
     tr_df, va_df = fold_frames(fold)
@@ -3667,17 +3836,23 @@ def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
     print(f"[train] mode {cfg.finetune_mode} | seed {cfg.seed} | "
           f"determinism {'on' if cfg.deterministic else 'off'}")
     print(f"[train] cosine annealing: warmup {cfg.warmup_ratio:.0%}, floor {cfg.min_lr_ratio:.0%}"
-          f" of peak lr {cfg.lr:g}\n{'='*78}")
+          f" of peak lr {cfg.lr:g}")
+    if adapter_path:
+        print(f"[train] warm-start from {adapter_path}")
+    print("=" * 78)
 
     tb = TBLogger(tag, enabled=cfg.tensorboard)
     tb.text("config", "```json\n" + json.dumps(
         {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(cfg).items()},
         indent=2) + "\n```")
 
-    model = build_model(cfg, for_training=True)
+    model = build_model(cfg, adapter_path=adapter_path, for_training=True)
     args = make_training_args(cfg, OUT / "checkpoints" / tag, steps_per_epoch, tb.dir)
 
-    ema = AdapterEMA(model, cfg.ema_decay) if cfg.ema_decay and cfg.ema_decay > 0 else None
+    # warmup_steps=4 -> decay (1+n)/(5+n), a running average over roughly the last
+    # quarter of a 666-step run. The class default of 20 never reaches cfg.ema_decay
+    # (0.999) in that many steps, which is why raw and EMA scored the same.
+    ema = AdapterEMA(model, cfg.ema_decay, warmup_steps=4) if cfg.ema_decay and cfg.ema_decay > 0 else None
     val_cb = GenerationEvalCallback(model, PROCESSOR, cfg, va_df, eval_every,
                                     OUT / "checkpoints", ema=ema,
                                     max_samples=cfg.eval_max_samples, tag=tag, tb=tb)
@@ -3725,73 +3900,172 @@ def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
 
 # ## 12. Run training
 #
-# `CFG.train_folds` controls the budget. Guidance for a single 48 GB card:
+# Fold-0 already peaked at step 532 of 666 (val 0.90477, raw). More epochs on that
+# same run will not help. We **pull those LoRA weights** from the hub and continue
+# from them:
 #
-# | Setting | Wall clock | Use for |
+# * `fold0_seed42` is restored, never retrained.
+# * `full_from42` warm-starts that adapter on every labelled line, at a lower LR,
+#   so the extra ~25% of data can move the weights without wiping the first run.
+# * `fold0_seed7` is a *new* adapter on the same val fold. Fusion needs a second
+#   error pattern; continuing seed-42 a second time would not give it one.
+#
+# Tags that already exist on the hub or in `runs.json` are skipped.
+#
+# Budget on a 48 GB card, including decode:
+#
+# | Tag | Wall clock | Role |
 # |---|---|---|
-# | `train_folds = (0,)` | ~45 min | first end-to-end pass, sanity check |
-# | `train_folds = (0, 1, 2)` | ~2.5 h | ensembling starts paying off here |
-# | `train_folds = (0, 1, 2, 3, 4)` | ~4 h | full out-of-fold coverage for tuning |
+# | `fold0_seed42` | restored | first voter, pulled from the hub |
+# | `fold0_seed7` | ~3 h | second voter, same validation fold, from scratch |
+# | `full_from42` | ~1.5 h | continue seed-42 on all labelled lines |
 #
-# Each fold writes only its best adapter (selected on generation CER/WER, not loss),
-# so disk stays bounded regardless of how many evaluations run. Each fold is also
-# pushed to the hub the moment it finishes, so an interrupted run loses at most the
-# fold that was in flight.
-#
-# With `CFG.hf_resume = True` this cell downloads a previous run's checkpoints
-# instead of training and jumps straight to decoding — the same weights, therefore
-# the same score, without repeating the GPU hours.
+# High-res (`line_height=192`) is a *different* session: `CACHE_DIR` is fixed at
+# import by `load_line`. Do not uncomment those `CLI_OVERRIDES` here.
+
+import dataclasses
+
+RUN_PLAN = [
+    dict(tag="fold0_seed42", fold=0),                          # restored from hub
+    dict(tag="fold0_seed7",  fold=0, over=dict(seed=7)),       # 2nd voter, from scratch
+    dict(tag="full_from42",  fold=0,                           # continue fold0_seed42
+         over=dict(seed=42, epochs=2.0, lr=4e-5),
+         init_from="fold0_seed42"),
+]
 
 RUN_TRAINING = True     # set False to reuse artifacts/runs.json from a previous pass
-RUNS: list[dict] = []
+
+
+def _is_checkpoint_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        (path / "adapter_config.json").exists()
+        or any(path.glob("adapter_model*.safetensors"))
+        or any(path.glob("*.safetensors"))
+    )
+
+
+def _fill_val_ids(run: dict) -> dict:
+    if run.get("val_ids"):
+        return run
+    fold = int(run.get("fold", 0))
+    try:
+        _, va = fold_frames(fold)
+        run["val_ids"] = va["ID"].tolist()
+    except Exception:
+        run["val_ids"] = []
+    return run
+
+
+def _synthesize_run(tag: str, path: Path) -> dict:
+    fold = 0
+    m = re.match(r"fold(\d+)_", tag)
+    if m:
+        fold = int(m.group(1))
+    run = {
+        "tag": tag,
+        "fold": fold,
+        "best": {"path": str(path), "score": float("nan"), "source": "hub", "step": None},
+        "history": pd.DataFrame(),
+        "seed": CFG.seed,
+        "finetune_mode": CFG.finetune_mode,
+    }
+    print(f"[hub] synthesized run record for {tag} <- {path}")
+    return _fill_val_ids(run)
 
 
 def restore_runs_from_hub() -> list:
-    """Pull a previous run's checkpoints back down so decoding can start immediately."""
+    """Pull fold0_seed42 (and any later voters) so we can continue instead of retrain."""
     local = OUT / "hub_restore"
     root = HUB.pull(["runs.json", "checkpoints/**", "history/**"], local)
     if root is None:
         print("[hub] nothing restored - falling back to local artefacts")
         return []
-    with open(Path(root) / "runs.json") as fh:
-        runs = json.load(fh)
-    for r in runs:
-        tag = r["tag"]
-        # Rewrite the recorded paths onto whatever this machine calls them.
-        for key, remote in (("best", f"checkpoints/{tag}"),
-                            ("grpo", f"checkpoints/grpo_fold{r['fold']}")):
-            path = Path(root) / remote
-            if not path.exists():
+    root = Path(root)
+    runs: list = []
+    runs_path = root / "runs.json"
+    if runs_path.exists():
+        with open(runs_path) as fh:
+            runs = json.load(fh)
+        for r in runs:
+            tag = r["tag"]
+            for key, remote in (("best", f"checkpoints/{tag}"),
+                                ("grpo", f"checkpoints/grpo_fold{r.get('fold', 0)}")):
+                path = root / remote
+                if not path.exists():
+                    continue
+                if key == "best":
+                    r.setdefault("best", {})["path"] = str(path)
+                else:
+                    r["grpo_path"] = str(path)
+            hist = root / "history" / f"val_history_{tag}.csv"
+            r["history"] = pd.read_csv(hist) if hist.exists() else pd.DataFrame()
+            _fill_val_ids(r)
+    known = {r["tag"] for r in runs}
+    ckpt_root = root / "checkpoints"
+    if ckpt_root.exists():
+        for d in sorted(ckpt_root.iterdir()):
+            if d.name in known or not _is_checkpoint_dir(d):
                 continue
-            if key == "best":
-                r["best"]["path"] = str(path)
-            else:
-                r["grpo_path"] = str(path)
-        hist = Path(root) / "history" / f"val_history_{tag}.csv"
-        r["history"] = pd.read_csv(hist) if hist.exists() else pd.DataFrame()
-    print(f"[hub] restored {len(runs)} runs from {HUB.repo_id}")
+            runs.append(_synthesize_run(d.name, d))
+    if not runs:
+        print("[hub] snapshot had no usable checkpoints - falling back to local artefacts")
+        return []
+    print(f"[hub] restored {len(runs)} run(s) from {HUB.repo_id}: "
+          + ", ".join(r["tag"] for r in runs))
     return runs
 
 
-if CFG.hf_resume:
-    RUNS = restore_runs_from_hub()
-    RUN_TRAINING = not RUNS      # only train if the restore came back empty
+def _load_local_runs() -> list:
+    path = OUT / "runs.json"
+    if not path.exists():
+        return []
+    with open(path) as fh:
+        runs = json.load(fh)
+    print(f"[runs] restored {len(runs)} runs from disk")
+    return runs
 
-if RUN_TRAINING:
-    stage(f"training {len(CFG.train_folds)} fold(s), mode {CFG.finetune_mode}")
-    NOTIFY.run_started()
-    _folds = progress(CFG.train_folds, desc="folds", unit="fold")
-    for fold in _folds:
-        RUNS.append(train_fold(fold))
-        _folds.set_postfix_str(f"best {RUNS[-1]['best']['score']:.5f}", refresh=False)
-    _folds.close()
+
+RUNS = restore_runs_from_hub() if CFG.hf_resume else []
+if not RUNS:
+    RUNS = _load_local_runs()
+_done = {r["tag"] for r in RUNS}
+
+
+def _save_runs():
     with open(OUT / "runs.json", "w") as fh:
         json.dump([{k: v for k, v in r.items() if k != "history"} for r in RUNS], fh, indent=2)
-    HUB.push_file(OUT / "runs.json", "runs.json", "record fold results")
+    HUB.push_file(OUT / "runs.json", "runs.json", "record runs")
+
+
+if RUN_TRAINING:
+    stage(f"training {len(RUN_PLAN)} run(s)")
+    if any(spec["tag"] not in _done for spec in RUN_PLAN):
+        NOTIFY.run_started()
+    for spec in RUN_PLAN:
+        if spec["tag"] in _done:
+            print(f"[runs] {spec['tag']} already trained - skipping")
+            continue
+        cfg = dataclasses.replace(CFG, **spec.get("over", {}))
+        kw = {}
+        if spec["tag"].startswith("full_"):
+            # Train on every labelled line. The 64-line "val" is only a sanity check;
+            # it sits inside the training set, so checkpoint selection is meaningless here.
+            kw = dict(train_override=train_df[["ID", "Target"]],
+                      val_override=train_df.sample(64, random_state=0)[["ID", "Target"]])
+        parent = spec.get("init_from")
+        if parent:
+            src = next((r for r in RUNS if r["tag"] == parent), None)
+            path = Path(src["best"]["path"]) if src and src.get("best", {}).get("path") else None
+            if path is None or not path.exists():
+                raise SystemExit(f"[runs] {spec['tag']} needs {parent} on disk first "
+                                 f"(hub resume failed to pull it)")
+            kw["adapter_path"] = path
+            print(f"[runs] {spec['tag']} continues from {parent} ({path})")
+        RUNS.append(train_fold(spec["fold"], cfg=cfg, tag=spec["tag"], **kw))
+        _done.add(spec["tag"])
+        _save_runs()
 elif not RUNS:
-    with open(OUT / "runs.json") as fh:
-        RUNS = json.load(fh)
-    print(f"[runs] restored {len(RUNS)} runs from disk")
+    RUNS = _load_local_runs()
 
 for r in RUNS:
     print(f"  {r['tag']:<24} best {r['best']['score']:.5f} ({r['best']['source']}) "
@@ -3825,18 +4099,16 @@ if RUNS and isinstance(RUNS[0].get("history"), pd.DataFrame) and len(RUNS[0]["hi
 # **competition metric as the reward**, and pushing probability mass towards the
 # candidates that beat their group's average.
 #
-# This stage is on by default, but it is the highest-variance part of the notebook:
-# it needs a working TRL vision-language `GRPOTrainer`, every step samples `G`
-# completions so it is slow, and a bad reward scale can undo the SFT gains. Three
-# guards make it safe to leave enabled:
+# This stage is **off** by default. On the fold-0 run the 6 samples per image were
+# nearly identical (`reward_std` 0.02–0.04), so the advantages are noise on 320
+# validation lines. Re-enable `run_grpo` in `CLI_OVERRIDES` only if you have a
+# verdict-tab gain clearly above +0.005. Three guards still apply if you do:
 #
 # * **A KL leash** (`beta = 0.02`) back to the SFT policy, so it polishes rather than
 #   wanders.
 # * **A tiny learning rate** (`2e-6`), two orders below the SFT rate.
-# * **An acceptance test.** The polished adapter is decoded on held-out data from the
-#   same fold and compared with the SFT adapter that produced it. If it does not win,
-#   it is discarded and the SFT adapter continues to the decoding stage. Turning GRPO
-#   on therefore cannot make the submission worse — only slower.
+# * **An acceptance test** with a 0.004 margin (320-sample noise is about ±0.003).
+#   If the polished adapter does not beat SFT by that much, it is discarded.
 #
 # The gate is the important part. Competitors reported real gains from GRPO on this
 # leaderboard, but an ungated RL stage is precisely the kind of thing that silently
@@ -3973,7 +4245,9 @@ def grpo_stage(run: dict, cfg: Config = None) -> dict:
     tb.scalars({"sft": sft_score, "grpo": grpo_score, "delta": delta}, 0, prefix="verdict/")
     tb.close()
 
-    accepted = delta > 0
+    # 320-sample noise is about ±0.003; treating any positive delta as a win
+    # accepts noise. Require a margin that is larger than that.
+    accepted = delta > 0.004
     if accepted:
         run["grpo_path"] = grpo_path
         print(f"[grpo] fold {fold}: ACCEPTED, decoding will use the polished weights")
@@ -3989,9 +4263,14 @@ def grpo_stage(run: dict, cfg: Config = None) -> dict:
 
 if CFG.run_grpo and RUNS:
     stage("GRPO polish + acceptance test")
-    RUNS = [grpo_stage(r) for r in progress(RUNS, desc="grpo", unit="fold")]
+    _todo = [r for r in RUNS if not r["tag"].startswith("full_")]
+    _skipped = [r for r in RUNS if r["tag"].startswith("full_")]
+    _todo = [grpo_stage(r) for r in progress(_todo, desc="grpo", unit="fold")]
+    RUNS = _todo + _skipped
     _kept = sum("grpo_path" in r for r in RUNS)
-    print(f"\n[grpo] {_kept}/{len(RUNS)} folds improved and will decode with GRPO weights")
+    print(f"\n[grpo] {_kept}/{len(_todo)} fold models improved and will decode with GRPO weights")
+    if _skipped:
+        print(f"[grpo] skipped {len(_skipped)} all-data run(s) (leaky val)")
 else:
     print("[grpo] disabled (CFG.run_grpo = False)")
 
@@ -4007,9 +4286,10 @@ else:
 # views; those pooled lists are the input to the fusion stage.
 #
 # Cost control: the number of forward passes is
-# `folds x (len(scales) + 2 if photometric) x beams`. On a 48 GB card, one adapter
+# `models x (len(scales) + 2 if photometric) x beams`. On a 48 GB card, one adapter
 # over the 1 374 test images with 4 views and 5 beams takes roughly an hour. Set
-# `FAST_DECODE = True` for a single greedy view while iterating.
+# `FAST_DECODE = True` for a single greedy view while iterating. Predictions are
+# pulled from / pushed to the hub so a dead pod does not redo 1–2 hours per adapter.
 
 FAST_DECODE = False
 
@@ -4057,6 +4337,8 @@ def decode_run(run: dict, cfg: Config = None, force: bool = False) -> dict:
                               photometric=DECODE_PHOTOMETRIC, **DECODE_KW)
     save_nbest(oof, oof_path)
     save_nbest(test, test_path)
+    HUB.push_file(oof_path, f"preds/{oof_path.name}", f"decoded {tag} oof")
+    HUB.push_file(test_path, f"preds/{test_path.name}", f"decoded {tag} test")
 
     del engine, model
     free_gpu()
@@ -4070,13 +4352,17 @@ def decode_run(run: dict, cfg: Config = None, force: bool = False) -> dict:
 
 
 stage("decode out-of-fold + test")
+HUB.pull(["preds/**"], OUT)
 DECODES = [decode_run(r) for r in progress(RUNS, desc="adapters", unit="model")]
+HUB.push_folder(OUT / "preds", "preds", "decoded n-best lists")
 
-# Assemble the out-of-fold table. With every fold trained this covers the whole
-# training set; with a subset it covers those folds only - still enough to tune the
-# post-processing, just noisier.
+# Assemble the out-of-fold table. All-data models are excluded: their "validation"
+# lines sat inside the training set, so they would leak into the fusion search.
+# They still vote on TEST_NBEST below.
 OOF_NBEST: dict[str, list] = defaultdict(list)
 for d in DECODES:
+    if d["tag"].startswith("full_"):     # its "validation" lines were in its training set
+        continue
     for image_id, cands in d["oof"].items():
         for c in cands:
             OOF_NBEST[image_id].append({**c, "model": d["tag"]})
@@ -4111,6 +4397,480 @@ print(f"[oof] oracle over N-best : {competition_score(OOF_REFS, _oracle)['score'
 print(f"[oof] anti-oracle        : {competition_score(OOF_REFS, _worst)['score']:.5f}")
 print(f"[oof] headroom from selection alone: "
       f"{competition_score(OOF_REFS, _oracle)['score'] - BASELINE['score']:+.5f}")
+
+# ==========================================================================
+# p13a_ctc.py
+# ==========================================================================
+
+# ### 14.1 Second recogniser: kraken PP-OCRv6 (CTC)
+#
+# **Why this exists.** The BHL OCR leaderboard (finebooks/bhl-ocr-leaderboard,
+# updated 2026-09-03) found that kraken's 15.9M-parameter PP-OCRv6 port reads
+# 18th–19th-century book pages about as well as the best VLMs hundreds of times its
+# size: reading-lane CER .034 [.024–.044] against .051 [.029–.077] for Qwen3.5-9B,
+# .041 vs .067 diplomatic CER, and **0 % looped pages** against 1.5 %.
+#
+# Three things temper that for this challenge, and they shape how it is used here:
+#
+# * The board is **zero-shot on printed books**; this task is **fine-tuned on
+#   17th-century handwriting**. A VLM fine-tuned on 3 300 in-domain lines is a
+#   different animal from one read zero-shot, so the ranking may not transfer.
+# * The reading-CER confidence intervals overlap. The board's own guidance is that
+#   overlapping intervals mean "within noise". The differences that are clearly
+#   outside noise are the *failure modes*: CTC never loops and never invents text
+#   on near-empty lines, because it emits one label per image column.
+# * Different architecture means different mistakes, and that is exactly what a
+#   ROVER vote converts into accuracy.
+#
+# So the CTC model is **not a replacement** for the VLM. It is fine-tuned per fold on
+# the same lines, decoded with photometric TTA, and handed to Section 15 as
+#
+# 1. extra hypotheses in the confusion network, and
+# 2. an **anchor feature**: how close each VLM hypothesis is to what the CTC model
+#    read, which penalises runaway or hallucinated VLM output.
+#
+# Section 15 tunes the fusion twice — with and without the CTC member — and keeps
+# the CTC member only if it wins out-of-fold, the same gate GRPO uses. It also
+# reports the zero-shot and fine-tuned CTC scores on *our* data, which is the
+# direct test of whether the leaderboard finding carries over.
+#
+# **Isolation.** kraken 7.1 pins `torch>=2.9`, `scipy~=1.15` and `scikit-learn~=1.7`,
+# which would fight the VLM stack. It therefore lives in its own virtualenv
+# (`CFG.ctc_venv`) and is driven through subprocesses; nothing here can break the
+# main environment. Any failure in this section prints a warning and the pipeline
+# continues VLM-only.
+#
+# **Cost.** A 16M-parameter model on ~3 300 lines: a few minutes per fold on the
+# card that just trained an 8B VLM, which is why every fold is trained by default
+# (`CFG.ctc_folds = ()`), even when the VLM trains only one.
+
+import dataclasses
+import subprocess
+
+import cv2
+from PIL import Image
+
+CTC_ROOT = OUT / "ctc"
+CTC_LINES = CTC_ROOT / "lines"          # <ID>.png (+ <ID>.gt.txt for train)
+CTC_MODELS = CTC_ROOT / "models"
+CTC_LOGS = CTC_ROOT / "logs"
+
+
+def ctc_config(cfg: Config = None) -> Config:
+    """Image settings for the CTC branch: same cleaning, kraken's line height."""
+    cfg = cfg or CFG
+    return dataclasses.replace(cfg, line_height=cfg.ctc_line_height,
+                               max_line_width=cfg.ctc_max_width or 8192,
+                               max_upscale=max(cfg.max_upscale, 3.0))
+
+
+def ctc_folds(cfg: Config = None) -> tuple:
+    cfg = cfg or CFG
+    return tuple(cfg.ctc_folds) if cfg.ctc_folds else tuple(range(cfg.n_folds))
+
+
+def ctc_line(image_id: str, cfg: Config = None, mode: str = "identity") -> np.ndarray:
+    """Background-flattened, deskewed line at the CTC model's input height.
+
+    kraken height-normalises again internally; doing the cleaning here keeps the
+    two recognisers looking at the same pixels, so their disagreements are about
+    reading rather than preprocessing.
+    """
+    ccfg = ctc_config(cfg)
+    path = image_path(image_id)
+    if path is None:
+        return np.full((ccfg.line_height, ccfg.min_line_width), 235, np.uint8)
+    img = normalize_line(read_gray(path), ccfg)
+    if mode != "identity":
+        img = photometric_variant(img, mode)
+    return img
+
+
+def write_ctc_lines(ids: Sequence[str], texts: Sequence[str] | None,
+                    dest: Path, cfg: Config = None, mode: str = "identity") -> list:
+    """Write kraken `path`-format ground truth: X.png next to X.gt.txt."""
+    dest.mkdir(parents=True, exist_ok=True)
+    paths = []
+    texts = list(texts) if texts is not None else [None] * len(ids)
+    for image_id, text in zip(ids, texts):
+        png = dest / f"{image_id}.png"
+        if not png.exists():
+            cv2.imwrite(str(png), ctc_line(image_id, cfg, mode))
+        if text is not None:
+            gt = dest / f"{image_id}.gt.txt"
+            if not gt.exists() or gt.read_text(encoding="utf-8") != text:
+                gt.write_text(text, encoding="utf-8")
+        paths.append(png)
+    return paths
+
+
+def write_manifest(paths: Sequence[Path], path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(str(Path(p).resolve()) for p in paths) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def ctc_width_report(paths: Sequence[Path], cfg: Config = None) -> dict:
+    """Widths *after* kraken rescales each line to the model height.
+
+    ketos silently drops training lines wider than --max-width, and the width that
+    matters is the one after its own height normalisation, not the PNG's. A crop
+    that `normalize_line` had to shrink below 128 px to fit its width cap is scaled
+    back up by kraken - and would vanish from training without this check.
+    """
+    cfg = cfg or CFG
+    widths = []
+    for p in paths:
+        with Image.open(p) as im:
+            w, h = im.size
+        widths.append(w * cfg.ctc_line_height / max(h, 1))
+    widths = np.asarray(widths) if widths else np.zeros(1)
+    # +64: kraken pads 16 px each side before checking, plus augmentation slack.
+    auto = int(math.ceil((widths.max() + 64) / 64.0) * 64)
+    limit = cfg.ctc_max_width or auto
+    return {"n": int(len(widths)), "max": int(widths.max()),
+            "p99": float(np.percentile(widths, 99)), "max_width": int(limit),
+            "over_limit": int((widths > limit).sum())}
+
+
+def venv_bin(venv: Path, name: str) -> Path:
+    sub = "Scripts" if os.name == "nt" else "bin"
+    exe = f"{name}.exe" if os.name == "nt" else name
+    return Path(venv) / sub / exe
+
+
+def ketos_train_cmd(ketos: Path, base_model: Path, train_manifest: Path,
+                    val_manifest: Path, out_dir: Path, cfg: Config = None,
+                    max_width: int | None = None) -> list:
+    """Fine-tune the PP-OCRv6 checkpoint. Every flag below exists in kraken 7.1.1.
+
+    * `--resize union` keeps the pretrained codec and adds the challenge-only
+      symbols (`^`, `~`, ...) as new output classes.
+    * `-u NFD` matches how the base model was trained; predictions are folded back
+      to NFC by `normalize_text` before scoring.
+    * `--deterministic` is kraken's deterministic mode, which is `warn`-only for Lightning — the
+      CUDA CTC-loss backward has no deterministic kernel and would otherwise abort.
+    """
+    cfg = cfg or CFG
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    precision = "bf16-mixed" if (torch.cuda.is_available()
+                                 and torch.cuda.is_bf16_supported()) else "32-true"
+    cmd = [str(ketos), "-v", "-d", device, "--precision", precision,
+           "--workers", str(min(8, max(1, cfg.dataloader_workers))),
+           "-s", str(cfg.seed)]
+    if cfg.deterministic:
+        cmd.append("--deterministic")
+    cmd += ["train", "-f", "path", "-i", str(base_model), "--resize", "union",
+            "-u", "NFD", "--normalize-whitespace",
+            "-t", str(train_manifest), "-e", str(val_manifest),
+            "-o", str(out_dir), "-B", str(cfg.ctc_batch_size),
+            "-N", str(cfg.ctc_epochs), "-q", "fixed", "-F", "1",
+            "--lrate", str(cfg.ctc_lr), "--warmup", str(cfg.ctc_warmup),
+            "--max-width", str(max_width or cfg.ctc_max_width or 4096)]
+    cmd.append("--augment" if cfg.ctc_augment else "--no-augment")
+    return cmd
+
+
+def best_ctc_weights(out_dir: Path) -> Path | None:
+    """ketos writes best_<val_metric>.safetensors next to its checkpoints."""
+    found = []
+    for p in Path(out_dir).glob("best_*.safetensors"):
+        try:
+            found.append((float(p.stem.split("_", 1)[1]), p))
+        except ValueError:
+            continue
+    return max(found)[1] if found else None
+
+
+# The recogniser runs inside the kraken venv. Lines are tiled onto one tall canvas
+# per batch so kraken sees a multi-line bbox segmentation and batches them through
+# the network together, instead of one call per 16M-parameter forward pass.
+CTC_WORKER = r'''
+import json, math, sys
+from pathlib import Path
+from PIL import Image
+from kraken.containers import BBoxLine, Segmentation
+from kraken.configs import RecognitionInferenceConfig
+from kraken.tasks import RecognitionTaskModel
+
+job = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+model = RecognitionTaskModel.load_model(job["model"])
+dev = job.get("device", "cpu")
+if dev.startswith("cuda"):
+    accelerator, devices = "gpu", [int(dev.split(":")[1]) if ":" in dev else 0]
+else:
+    accelerator, devices = "cpu", 1
+config = RecognitionInferenceConfig(batch_size=job["batch"], num_line_workers=0,
+                                    accelerator=accelerator, device=devices)
+items, gap, out = job["items"], 16, []
+for start in range(0, len(items), job["batch"]):
+    chunk = items[start:start + job["batch"]]
+    ims = [Image.open(it["path"]).convert("L") for it in chunk]
+    width = max(im.width for im in ims)
+    height = sum(im.height for im in ims) + gap * (len(ims) + 1)
+    canvas = Image.new("L", (width, height), 255)
+    lines, y = [], gap
+    for k, im in enumerate(ims):
+        canvas.paste(im, (0, y))
+        lines.append(BBoxLine(id=f"l{k}", bbox=(0, y, im.width, y + im.height)))
+        y += im.height + gap
+    seg = Segmentation(type="bbox", imagename="canvas", text_direction="horizontal-lr",
+                       script_detection=False, lines=lines)
+    for it, rec in zip(chunk, model.predict(im=canvas, segmentation=seg, config=config)):
+        conf = [max(float(c), 1e-6) for c in (rec.confidences or [])]
+        score = sum(math.log(c) for c in conf) / len(conf) if conf else -5.0
+        out.append({"ID": it["id"], "text": rec.prediction, "score": score})
+    print(f"ctc worker {min(start + len(chunk), len(items))}/{len(items)}", flush=True)
+Path(job["out"]).write_text(json.dumps(out), encoding="utf-8")
+'''
+
+
+def run_logged(cmd: list, log_path: Path, env: dict | None = None,
+               echo_every: float = 30.0) -> int:
+    """Run a subprocess, tee its output to a log, echo a line every `echo_every` s."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    print("[ctc] $", " ".join(map(str, cmd))[:400])
+    last = 0.0
+    with open(log_path, "a", encoding="utf-8") as fh:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors="replace", env=env)
+        for line in proc.stdout:
+            fh.write(line)
+            now = time.time()
+            if INTERACTIVE or now - last > echo_every or "error" in line.lower():
+                print(f"[ctc]   {line.rstrip()[:200]}")
+                last = now
+        return proc.wait()
+
+
+def ctc_frame_to_nbest(df: pd.DataFrame, model_tag: str) -> dict:
+    """Rows of (ID, text, score, view) -> the pooled N-best structure of Section 14."""
+    out: dict[str, list] = defaultdict(list)
+    for row in df.itertuples():
+        out[row.ID].append({"text": normalize_text(row.text), "score": float(row.score),
+                            "view": row.view, "rank": 0,
+                            "model": model_tag, "family": "ctc"})
+    return dict(out)
+
+
+def merge_nbest(base: dict, extra: dict, only: set | None = None) -> dict:
+    merged = {k: list(v) for k, v in base.items()}
+    for image_id, cands in extra.items():
+        if only is not None and image_id not in only:
+            continue
+        merged.setdefault(image_id, []).extend(cands)
+    return merged
+
+CTC_STATUS = "disabled"
+CTC_REPORT: dict = {}
+CTC_DECODES: list[dict] = []
+
+
+def ensure_kraken_env(cfg: Config = None) -> tuple[Path, Path]:
+    """Create (once) an isolated venv with kraken; return (python, ketos)."""
+    cfg = cfg or CFG
+    venv = WORK / cfg.ctc_venv
+    py, ketos = venv_bin(venv, "python"), venv_bin(venv, "ketos")
+    probe = [str(py), "-c", "import kraken.train.ppocr, kraken.tasks; import kraken; "
+                            "print(kraken.__version__ if hasattr(kraken,'__version__') else '')"]
+    if py.exists() and subprocess.run(probe, capture_output=True).returncode == 0:
+        return py, ketos
+    log = CTC_LOGS / "install.log"
+    if not py.exists():
+        subprocess.run([sys.executable, "-m", "venv", str(venv)], check=True)
+    pip_ = [str(py), "-m", "pip", "install", "-q", "--no-cache-dir"]
+    run_logged(pip_ + ["--upgrade", "pip"], log)
+    if cfg.ctc_torch_index:
+        rc = run_logged(pip_ + ["--index-url", cfg.ctc_torch_index,
+                                "torch>=2.9,<=2.14", "torchvision"], log)
+        if rc != 0:
+            print(f"[ctc] torch from {cfg.ctc_torch_index} failed; trying PyPI")
+    if run_logged(pip_ + [f"kraken=={cfg.ctc_kraken_version}"], log) != 0:
+        raise RuntimeError(f"kraken install failed - see {log}")
+    if subprocess.run(probe, capture_output=True).returncode != 0:
+        raise RuntimeError(f"kraken imports fail in {venv} - see {log}")
+    return py, ketos
+
+
+def ctc_decode(py: Path, model: Path, ids: Sequence[str], tag: str,
+               cfg: Config = None) -> pd.DataFrame:
+    """Decode `ids` with one CTC model across the photometric TTA views."""
+    cfg = cfg or CFG
+    frames = []
+    for mode in cfg.ctc_tta_modes:
+        line_dir = CTC_LINES if mode == "identity" else CTC_ROOT / f"lines_{mode}"
+        paths = write_ctc_lines(ids, None, line_dir, cfg, mode=mode)
+        job = CTC_ROOT / "jobs" / f"{tag}_{mode}.json"
+        res = CTC_ROOT / "jobs" / f"{tag}_{mode}.out.json"
+        job.parent.mkdir(parents=True, exist_ok=True)
+        job.write_text(json.dumps({
+            "model": str(model), "batch": int(cfg.ctc_infer_batch), "out": str(res),
+            "device": "cuda:0" if torch.cuda.is_available() else "cpu",
+            "items": [{"id": i, "path": str(p.resolve())} for i, p in zip(ids, paths)],
+        }), encoding="utf-8")
+        worker = CTC_ROOT / "ctc_worker.py"
+        worker.write_text(CTC_WORKER, encoding="utf-8")
+        rc = run_logged([str(py), str(worker), str(job)], CTC_LOGS / f"decode_{tag}.log")
+        if rc != 0 or not res.exists():
+            raise RuntimeError(f"ctc decode {tag}/{mode} failed (rc={rc})")
+        df = pd.DataFrame(json.loads(res.read_text(encoding="utf-8")))
+        df["view"] = f"ctc:{mode}"
+        frames.append(df)
+    out = pd.concat(frames, ignore_index=True)
+    out["text"] = out["text"].fillna("").map(normalize_text)
+    return out
+
+
+def ctc_top1_score(df: pd.DataFrame, ids: Sequence[str]) -> dict:
+    ident = df[df.view == "ctc:identity"].set_index("ID")["text"]
+    refs = train_df.set_index("ID").loc[list(ids), "Target"].tolist()
+    return competition_score(refs, [ident.get(i, "") for i in ids])
+
+
+def run_ctc_branch(cfg: Config = None) -> list:
+    cfg = cfg or CFG
+    folds = ctc_folds(cfg)
+    stage(f"kraken CTC branch: {len(folds)} fold(s)")
+    for d in (CTC_ROOT, CTC_MODELS, CTC_LOGS, CTC_ROOT / "preds"):
+        d.mkdir(parents=True, exist_ok=True)
+
+    if cfg.hf_resume and HUB.enabled:
+        HUB.pull(["ctc/models/**", "ctc/preds/**"], OUT)
+
+    _env: dict = {}
+
+    def env() -> tuple[Path, Path]:
+        """Build the kraken venv only if something actually needs to run in it."""
+        if not _env:
+            _env["py"], _env["ketos"] = ensure_kraken_env(cfg)
+        return _env["py"], _env["ketos"]
+
+    from huggingface_hub import hf_hub_download
+
+    base = Path(hf_hub_download(cfg.ctc_model_id, cfg.ctc_model_file,
+                                local_dir=str(CTC_ROOT / "base")))
+    print(f"[ctc] base model {cfg.ctc_model_id} -> {base.name} ({CTC_LICENCE})")
+
+    all_paths = write_ctc_lines(train_df.ID.tolist(), train_df.Target.tolist(),
+                                CTC_LINES, cfg)
+    widths = ctc_width_report(all_paths, cfg)
+    print(f"[ctc] {widths['n']} train lines at h={cfg.ctc_line_height}: "
+          f"max width {widths['max']}px, p99 {widths['p99']:.0f}px "
+          f"-> ketos --max-width {widths['max_width']}")
+    if widths["over_limit"]:
+        print(f"!! {widths['over_limit']} lines exceed ctc_max_width="
+              f"{widths['max_width']} and will be DROPPED by ketos - set "
+              f"CFG.ctc_max_width = 0 to size it from the data")
+    CTC_REPORT["widths"] = widths
+
+    # Zero-shot check: does the leaderboard result carry over to secretary hand?
+    zs_ids = OOF_IDS if OOF_IDS else train_df.ID.tolist()
+    zs_path = CTC_ROOT / "preds" / "oof_ctc_zeroshot.csv"
+    if zs_path.exists():
+        zs = pd.read_csv(zs_path, keep_default_na=False)
+    else:
+        zs = ctc_decode(env()[0], base, zs_ids, "zeroshot",
+                        dataclasses.replace(cfg, ctc_tta_modes=("identity",)))
+        zs.to_csv(zs_path, index=False)
+        HUB.push_file(zs_path, f"ctc/preds/{zs_path.name}", "ctc zero-shot oof")
+    CTC_REPORT["zero_shot"] = ctc_top1_score(zs, zs_ids)
+    print(f"[ctc] zero-shot PP-OCRv6 on our lines: "
+          f"score {CTC_REPORT['zero_shot']['score']:.5f} "
+          f"(CER {CTC_REPORT['zero_shot']['cer']:.4f}, "
+          f"WER {CTC_REPORT['zero_shot']['wer']:.4f}) | VLM raw top-1 "
+          f"{BASELINE['score']:.5f}")
+
+    decodes = []
+    for fold in progress(folds, desc="ctc folds", unit="fold"):
+        tag = f"ctc_fold{fold}"
+        oof_path = CTC_ROOT / "preds" / f"oof_{tag}.csv"
+        test_path = CTC_ROOT / "preds" / f"test_{tag}.csv"
+        tr_df, va_df = fold_frames(fold)
+        out_dir = CTC_MODELS / tag
+        weights = best_ctc_weights(out_dir)
+
+        if cfg.ctc_finetune and weights is None:
+            t0 = time.time()
+            tr_m = write_manifest([CTC_LINES / f"{i}.png" for i in tr_df.ID],
+                                  CTC_ROOT / "manifests" / f"{tag}_train.txt")
+            va_m = write_manifest([CTC_LINES / f"{i}.png" for i in va_df.ID],
+                                  CTC_ROOT / "manifests" / f"{tag}_val.txt")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (CTC_LOGS / f"train_{tag}.log").unlink(missing_ok=True)   # count this run only
+            rc = run_logged(ketos_train_cmd(env()[1], base, tr_m, va_m, out_dir, cfg,
+                                            max_width=widths["max_width"]),
+                            CTC_LOGS / f"train_{tag}.log")
+            weights = best_ctc_weights(out_dir)
+            _log = (CTC_LOGS / f"train_{tag}.log").read_text(encoding="utf-8", errors="replace")
+            _dropped = _log.count("Failed. Replacing")
+            if _dropped:
+                print(f"!! {tag}: ketos replaced {_dropped} unusable samples (too wide "
+                      f"or too many characters for the width) - see the train log")
+            CTC_REPORT[f"{tag}_replaced_samples"] = _dropped
+            if rc != 0 or weights is None:
+                raise RuntimeError(f"ketos train {tag} failed (rc={rc}); "
+                                   f"see {CTC_LOGS / f'train_{tag}.log'}")
+            print(f"[ctc] {tag}: {weights.name} in {fmt_hms(time.time() - t0)}")
+            if cfg.hf_push_checkpoints:
+                HUB.push_file(weights, f"ctc/models/{tag}/{weights.name}",
+                              f"{tag}: {weights.stem}")
+        weights = weights or base
+
+        if oof_path.exists() and test_path.exists():
+            oof = pd.read_csv(oof_path, keep_default_na=False)
+            test = pd.read_csv(test_path, keep_default_na=False)
+        else:
+            oof = ctc_decode(env()[0], weights, va_df.ID.tolist(), f"{tag}_oof", cfg)
+            test = ctc_decode(env()[0], weights, test_df.ID.tolist(), f"{tag}_test", cfg)
+            oof.to_csv(oof_path, index=False)
+            test.to_csv(test_path, index=False)
+            HUB.push_file(oof_path, f"ctc/preds/{oof_path.name}", f"{tag} oof")
+            HUB.push_file(test_path, f"ctc/preds/{test_path.name}", f"{tag} test")
+        res = ctc_top1_score(oof, va_df.ID.tolist())
+        CTC_REPORT[tag] = res
+        print(f"[ctc] {tag}: fine-tuned top-1 OOF score {res['score']:.5f} "
+              f"(CER {res['cer']:.4f}, WER {res['wer']:.4f})")
+        decodes.append({"tag": tag, "oof": ctc_frame_to_nbest(oof, tag),
+                        "test": ctc_frame_to_nbest(test, tag)})
+    return decodes
+
+
+if CFG.ctc_branch:
+    try:
+        CTC_DECODES = run_ctc_branch()
+        CTC_STATUS = f"ok ({len(CTC_DECODES)} fold models)"
+    except Exception as exc:
+        import traceback
+
+        CTC_DECODES = []
+        CTC_STATUS = f"failed: {type(exc).__name__}: {exc}"
+        print(f"!! CTC branch {CTC_STATUS}\n{traceback.format_exc()[-2000:]}")
+        print("!! continuing VLM-only; the submission is unaffected")
+        NOTIFY.send("CTC branch failed - continuing VLM-only",
+                    f"{CTC_STATUS}\n\n{traceback.format_exc()[-6000:]}")
+print(f"[ctc] status: {CTC_STATUS}")
+
+# Pool the CTC hypotheses with the VLM ones. OOF only for lines the VLM also covers,
+# so both families are tuned on exactly the same rows.
+_oof_set = set(OOF_IDS)
+for _d in CTC_DECODES:
+    OOF_NBEST = merge_nbest(OOF_NBEST, _d["oof"], only=_oof_set)
+    TEST_NBEST = merge_nbest(TEST_NBEST, _d["test"])
+HAS_CTC = any(c.get("family") == "ctc" for i in OOF_IDS for c in OOF_NBEST.get(i, []))
+
+if HAS_CTC:
+    _ctc_all = pd.concat([pd.read_csv(CTC_ROOT / "preds" / f"oof_{d['tag']}.csv",
+                                      keep_default_na=False) for d in CTC_DECODES])
+    CTC_REPORT["oof_top1"] = ctc_top1_score(_ctc_all, OOF_IDS)
+    _oracle_ctc = []
+    for image_id, ref in zip(OOF_IDS, OOF_REFS):
+        cands = {c["text"] for c in OOF_NBEST[image_id]}
+        _oracle_ctc.append(max((competition_score([ref], [t])["score"], t) for t in cands)[1])
+    CTC_REPORT["oracle_with_ctc"] = competition_score(OOF_REFS, _oracle_ctc)["score"]
+    print(f"[ctc] CTC top-1 on the VLM's OOF rows : {CTC_REPORT['oof_top1']['score']:.5f}")
+    print(f"[ctc] VLM raw top-1 on the same rows  : {BASELINE['score']:.5f}")
+    print(f"[ctc] oracle over VLM+CTC hypotheses  : {CTC_REPORT['oracle_with_ctc']:.5f}")
 
 # ==========================================================================
 # p14_fusion.py
@@ -4373,6 +5133,13 @@ _test_rover()
 # | `lm` | character n-gram log-probability per character, fold-safe |
 # | `oov` | fraction of words absent from the fold's training vocabulary |
 # | `lenz` | absolute z-score of the length against the training length distribution |
+# | `c_score`, `c_votes` | the same confidence / agreement signals from the kraken CTC member (Section 14.1) |
+# | `c_sim` | similarity of the string to the CTC consensus reading — the anchor that penalises VLM output drifting away from the page |
+#
+# Scores from the two recognisers live on different scales, so they get separate
+# columns; a string one family never produced gets that family's per-line floor.
+# The whole search runs twice — VLM-only and VLM+CTC — and the CTC member is kept
+# only if it wins out-of-fold.
 #
 # The search is a plain random search over the linear weights against the real
 # competition metric. With ~5 free parameters and a few hundred evaluations that is
@@ -4393,6 +5160,15 @@ class PostConfig:
     repair_freq: int = 3
     restrict_charset: bool = True
     collapse: bool = True
+    # kraken CTC member (Section 14.1); all zero == the VLM-only behaviour.
+    use_ctc: bool = False
+    w_ctc_score: float = 0.0
+    w_ctc_votes: float = 0.0
+    w_ctc_sim: float = 0.0
+
+    @property
+    def families(self) -> tuple:
+        return ("vlm", "ctc") if self.use_ctc else ("vlm",)
 
 
 FOLD_LM: dict[int, CharLM] = {}
@@ -4417,30 +5193,55 @@ def clean_candidate(text: str, restrict: bool, collapse: bool) -> str:
     return text
 
 
+def family_of(cand: dict) -> str:
+    return cand.get("family") or "vlm"
+
+
 def build_features(nbest: dict, ids: Sequence[str], fold_of: dict,
-                   restrict: bool = True, collapse: bool = True) -> dict:
-    """id -> {'texts': [...], 'M': (n_cand, 5) feature matrix}"""
+                   restrict: bool = True, collapse: bool = True,
+                   families: Sequence[str] = ("vlm", "ctc")) -> dict:
+    """id -> {'texts': [...], 'M': (n_cand, 9) feature matrix}"""
     feats = {}
     for image_id in progress(ids, desc="features", unit="line"):
         lm, lex = fold_resources(fold_of.get(image_id, -1))
+        n_models = max(1, len({c.get("model") for c in nbest.get(image_id, [])
+                               if family_of(c) in families}))
         agg: dict[str, dict] = {}
         for c in nbest.get(image_id, []):
+            fam = family_of(c)
+            if fam not in families:
+                continue
             text = clean_candidate(c["text"], restrict, collapse)
-            rec = agg.setdefault(text, {"scores": [], "votes": 0.0})
-            rec["scores"].append(float(c["score"]))
-            rec["votes"] += 1.0
+            rec = agg.setdefault(text, {"vlm": [], "ctc": [], "votes": 0.0})
+            rec[fam].append(float(c["score"]))
+            rec["votes"] += 1.0 / n_models
         if not agg:
-            agg[""] = {"scores": [-50.0], "votes": 1.0}
+            agg[""] = {"vlm": [-50.0], "ctc": [], "votes": 0.0}
+
+        v_all = [x for r in agg.values() for x in r["vlm"]]
+        c_all = [x for r in agg.values() for x in r["ctc"]]
+        v_floor = (min(v_all) - 1.0) if v_all else 0.0
+        c_floor = (min(c_all) - 1.0) if c_all else 0.0
+        consensus = None
+        if c_all:
+            consensus = max((t for t, r in agg.items() if r["ctc"]),
+                            key=lambda t: (len(agg[t]["ctc"]), max(agg[t]["ctc"])))
+
         texts, rows = [], []
         for text, rec in agg.items():
-            s = np.asarray(rec["scores"], dtype=np.float64)
+            v = np.asarray(rec["vlm"], dtype=np.float64)
+            c = np.asarray(rec["ctc"], dtype=np.float64)
             rows.append([
-                float(s.max()),
-                float(s.mean()),
+                float(v.max()) if v.size else v_floor,
+                float(v.mean()) if v.size else v_floor,
                 math.log1p(rec["votes"]),
                 lm.logprob_per_char(text),
                 lex.oov_rate(text),
                 abs((len(text) - lex.mean_chars) / lex.std_chars),
+                float(c.max()) if c.size else c_floor,
+                math.log1p(c.size),
+                float(Levenshtein.normalized_similarity(text, consensus))
+                if consensus is not None else 0.0,
             ])
             texts.append(text)
         feats[image_id] = {"texts": texts, "M": np.asarray(rows, dtype=np.float64)}
@@ -4452,7 +5253,10 @@ def combined_scores(M: np.ndarray, pc: PostConfig) -> np.ndarray:
             + pc.w_votes * M[:, 2]
             + pc.w_lm * M[:, 3]
             + pc.w_oov * M[:, 4]
-            + pc.w_lenz * M[:, 5])
+            + pc.w_lenz * M[:, 5]
+            + pc.w_ctc_score * M[:, 6]
+            + pc.w_ctc_votes * M[:, 7]
+            + pc.w_ctc_sim * M[:, 8])
 
 
 def apply_post(feats: dict, ids: Sequence[str], pc: PostConfig,
@@ -4489,8 +5293,7 @@ def apply_post(feats: dict, ids: Sequence[str], pc: PostConfig,
 
 stage("post-processing weight search")
 FOLD_OF = dict(zip(train_df.ID, train_df.fold))
-OOF_FEATS = build_features(OOF_NBEST, OOF_IDS, FOLD_OF,
-                           restrict=True, collapse=True)
+HAS_CTC = bool(globals().get("HAS_CTC", False))
 
 
 def oof_score(pc: PostConfig, feats: dict | None = None) -> float:
@@ -4499,98 +5302,182 @@ def oof_score(pc: PostConfig, feats: dict | None = None) -> float:
     return competition_score(OOF_REFS, [preds[i] for i in OOF_IDS])["score"]
 
 
-# ---------------------------------------------------------------- stage A --
-print("\n[tune] stage A: rescoring weights (ROVER off)")
-base_pc = PostConfig(use_rover=False, repair=False)
-best_pc, best_val = base_pc, oof_score(base_pc)
-print(f"  default weights            {best_val:.5f}")
+def tune_post(use_ctc: bool, label: str) -> tuple:
+    """Stages A-D for one member set. Returns (PostConfig, oof score, features)."""
+    fams = ("vlm", "ctc") if use_ctc else ("vlm",)
+    feats = build_features(OOF_NBEST, OOF_IDS, FOLD_OF, restrict=True, collapse=True,
+                           families=fams)
+    print(f"\n{'=' * 30} tuning: {label} {'=' * 30}")
 
-rng = np.random.default_rng(0)
-t0 = time.time()
-_bar = progress(range(CFG.lm_tune_iters), desc="tune A", unit="trial")
-for it in _bar:
-    trial = PostConfig(
-        w_score=float(rng.uniform(0.0, 2.0)),
-        w_votes=float(rng.uniform(0.0, 1.5)),
-        w_lm=float(rng.uniform(0.0, 1.2)),
-        w_oov=float(rng.uniform(-1.5, 0.1)),
-        w_lenz=float(rng.uniform(-0.3, 0.05)),
-        use_rover=False, repair=False,
-    )
-    val = oof_score(trial)
+    # ------------------------------------------------------------ stage A --
+    print("[tune] stage A: rescoring weights (ROVER off)")
+    base_pc = PostConfig(use_rover=False, repair=False, use_ctc=use_ctc)
+    starts = [("default weights", base_pc)]
+    if use_ctc:
+        # Two hand-picked starting points so the search does not have to find them:
+        # the VLM defaults anchored to the CTC reading, and CTC-only selection.
+        starts += [
+            ("defaults + CTC anchor", PostConfig(**{**asdict(base_pc), "w_ctc_sim": 1.0,
+                                                    "w_ctc_votes": 0.3})),
+            ("CTC only", PostConfig(w_score=0.0, w_votes=0.0, w_lm=0.1, w_oov=0.0,
+                                    w_lenz=0.0, use_rover=False, repair=False,
+                                    use_ctc=True, w_ctc_score=1.0, w_ctc_votes=1.0)),
+        ]
+    best_pc, best_val = None, -1.0
+    for name, pc in starts:
+        val = oof_score(pc, feats)
+        print(f"  {name:<26} {val:.5f}")
+        if val > best_val:
+            best_pc, best_val = pc, val
+
+    rng = np.random.default_rng(0)
+    t0 = time.time()
+    _bar = progress(range(CFG.lm_tune_iters), desc=f"tune A {label}", unit="trial")
+    for it in _bar:
+        trial = PostConfig(
+            w_score=float(rng.uniform(0.0, 2.0)),
+            w_votes=float(rng.uniform(0.0, 1.5)),
+            w_lm=float(rng.uniform(0.0, 1.2)),
+            w_oov=float(rng.uniform(-1.5, 0.1)),
+            w_lenz=float(rng.uniform(-0.3, 0.05)),
+            use_rover=False, repair=False, use_ctc=use_ctc,
+        )
+        if use_ctc:
+            trial.w_ctc_score = float(rng.uniform(0.0, 1.5))
+            trial.w_ctc_votes = float(rng.uniform(0.0, 1.5))
+            trial.w_ctc_sim = float(rng.uniform(0.0, 4.0))
+        val = oof_score(trial, feats)
+        if val > best_val:
+            best_pc, best_val = trial, val
+            _bar.write(f"  it {it:4d}  {val:.5f}  "
+                       f"score={trial.w_score:.2f} votes={trial.w_votes:.2f} "
+                       f"lm={trial.w_lm:.2f} oov={trial.w_oov:.2f} lenz={trial.w_lenz:.3f}"
+                       + (f" | ctc score={trial.w_ctc_score:.2f} votes={trial.w_ctc_votes:.2f}"
+                          f" sim={trial.w_ctc_sim:.2f}" if use_ctc else ""))
+        _bar.set_postfix_str(f"best {best_val:.5f}", refresh=False)
+    _bar.close()
+    print(f"[tune] stage A best {best_val:.5f} in {time.time()-t0:.0f}s")
+
+    # ------------------------------------------------------------ stage B --
+    print("[tune] stage B: ROVER")
+    stage_b = [(best_pc, best_val, "off")]
+    for level in ("char", "word"):
+        for temp in (0.03, 0.08, 0.2, 0.5):
+            trial = PostConfig(**{**asdict(best_pc), "use_rover": True,
+                                  "rover_level": level, "rover_temp": temp})
+            val = oof_score(trial, feats)
+            stage_b.append((trial, val, f"{level} T={temp}"))
+            print(f"  rover {level:<5} T={temp:<5} {val:.5f}")
+    best_pc, best_val, chosen = max(stage_b, key=lambda kv: kv[1])
+    print(f"[tune] stage B best: {chosen} -> {best_val:.5f}")
+
+    # ------------------------------------------------------------ stage C --
+    print("[tune] stage C: lexicon repair")
+    stage_c = [(best_pc, best_val, "off")]
+    for sim in (86.0, 90.0, 94.0):
+        for freq in (2, 5, 15):
+            trial = PostConfig(**{**asdict(best_pc), "repair": True,
+                                  "repair_sim": sim, "repair_freq": freq})
+            val = oof_score(trial, feats)
+            stage_c.append((trial, val, f"sim={sim} freq={freq}"))
+            print(f"  repair sim={sim} freq={freq:<3} {val:.5f}")
+    best_pc, best_val, chosen = max(stage_c, key=lambda kv: kv[1])
+    print(f"[tune] stage C best: {chosen} -> {best_val:.5f}")
+
+    # ------------------------------------------------------------ stage D --
+    print("[tune] stage D: charset restriction ablation")
+    unrestricted = build_features(OOF_NBEST, OOF_IDS, FOLD_OF, restrict=False,
+                                  collapse=True, families=fams)
+    trial = PostConfig(**{**asdict(best_pc), "restrict_charset": False})
+    val = oof_score(trial, unrestricted)
+    print(f"  restrict_charset=True   {best_val:.5f}")
+    print(f"  restrict_charset=False  {val:.5f}")
     if val > best_val:
-        best_pc, best_val = trial, val
-        _bar.write(f"  it {it:4d}  {val:.5f}  "
-                   f"score={trial.w_score:.2f} votes={trial.w_votes:.2f} "
-                   f"lm={trial.w_lm:.2f} oov={trial.w_oov:.2f} lenz={trial.w_lenz:.3f}")
-    _bar.set_postfix_str(f"best {best_val:.5f}", refresh=False)
-_bar.close()
-print(f"[tune] stage A best {best_val:.5f} in {time.time()-t0:.0f}s")
-
-# ---------------------------------------------------------------- stage B --
-print("\n[tune] stage B: ROVER")
-stage_b = [(best_pc, best_val, "off")]
-for level in ("char", "word"):
-    for temp in (0.03, 0.08, 0.2, 0.5):
-        trial = PostConfig(**{**asdict(best_pc), "use_rover": True,
-                              "rover_level": level, "rover_temp": temp})
-        val = oof_score(trial)
-        stage_b.append((trial, val, f"{level} T={temp}"))
-        print(f"  rover {level:<5} T={temp:<5} {val:.5f}")
-best_pc, best_val, chosen = max(stage_b, key=lambda kv: kv[1])
-print(f"[tune] stage B best: {chosen} -> {best_val:.5f}")
-
-# ---------------------------------------------------------------- stage C --
-print("\n[tune] stage C: lexicon repair")
-stage_c = [(best_pc, best_val, "off")]
-for sim in (86.0, 90.0, 94.0):
-    for freq in (2, 5, 15):
-        trial = PostConfig(**{**asdict(best_pc), "repair": True,
-                              "repair_sim": sim, "repair_freq": freq})
-        val = oof_score(trial)
-        stage_c.append((trial, val, f"sim={sim} freq={freq}"))
-        print(f"  repair sim={sim} freq={freq:<3} {val:.5f}")
-best_pc, best_val, chosen = max(stage_c, key=lambda kv: kv[1])
-print(f"[tune] stage C best: {chosen} -> {best_val:.5f}")
-
-# ---------------------------------------------------------------- stage D --
-print("\n[tune] stage D: charset restriction ablation")
-_unrestricted = build_features(OOF_NBEST, OOF_IDS, FOLD_OF, restrict=False, collapse=True)
-for restrict, feats in ((True, OOF_FEATS), (False, _unrestricted)):
-    trial = PostConfig(**{**asdict(best_pc), "restrict_charset": restrict})
-    val = oof_score(trial, feats=feats)
-    print(f"  restrict_charset={restrict}  {val:.5f}")
-    if not restrict and val > best_val:
-        best_pc, best_val = trial, val
+        best_pc, best_val, feats = trial, val, unrestricted
         print("  keeping the unrestricted charset")
+    return best_pc, best_val, feats
 
-POST = best_pc
+
+TUNED = {"vlm": tune_post(False, "VLM only")}
+if HAS_CTC:
+    TUNED["vlm+ctc"] = tune_post(True, "VLM + kraken CTC")
+
+print("\n[tune] member-set gate (out-of-fold):")
+for _k, (_pc, _v, _) in TUNED.items():
+    print(f"  {_k:<10} {_v:.5f}")
+_choice = max(TUNED, key=lambda k: TUNED[k][1])
+POST, best_val, OOF_FEATS = TUNED[_choice]
+if HAS_CTC:
+    _delta = TUNED["vlm+ctc"][1] - TUNED["vlm"][1]
+    verdict = "KEPT" if _choice == "vlm+ctc" else "DROPPED"
+    print(f"[tune] kraken CTC member {verdict} ({_delta:+.5f} OOF)")
+    CTC_REPORT["gate_delta"] = _delta
+    CTC_REPORT["gate_kept"] = _choice == "vlm+ctc"
+    # All three weights are fitted on the same OOF rows the gate reads, so a
+    # delta within ~1e-4 is not evidence either way.
+    if abs(_delta) < 1e-4:
+        print("[tune] note: the difference is within tuning noise")
+
 with open(OUT / "post_config.json", "w") as fh:
     json.dump(asdict(POST), fh, indent=2)
 print(f"\n[tune] final post-processing config:\n{json.dumps(asdict(POST), indent=2)}")
 
 # Incremental contribution of each stage, measured out-of-fold.
+_vlm_feats = TUNED["vlm"][2]
+_vlm_post = TUNED["vlm"][0]
 ladder = [
-    ("raw best beam", PostConfig(w_score=1.0, w_votes=0.0, w_lm=0.0, w_oov=0.0,
-                                 w_lenz=0.0, use_rover=False, repair=False,
-                                 restrict_charset=False, collapse=False)),
-    ("+ cleanup (charset, loops)", PostConfig(w_score=1.0, w_votes=0.0, w_lm=0.0,
-                                              w_oov=0.0, w_lenz=0.0, use_rover=False,
-                                              repair=False)),
-    ("+ vote/LM rescoring", PostConfig(**{**asdict(POST), "use_rover": False, "repair": False})),
-    ("+ ROVER", PostConfig(**{**asdict(POST), "repair": False})),
-    ("+ lexicon repair", POST),
+    ("raw best beam", _vlm_feats, PostConfig(w_score=1.0, w_votes=0.0, w_lm=0.0,
+                                             w_oov=0.0, w_lenz=0.0, use_rover=False,
+                                             repair=False, restrict_charset=False,
+                                             collapse=False)),
+    ("+ cleanup (charset, loops)", _vlm_feats, PostConfig(w_score=1.0, w_votes=0.0,
+                                                          w_lm=0.0, w_oov=0.0,
+                                                          w_lenz=0.0, use_rover=False,
+                                                          repair=False)),
+    ("+ vote/LM rescoring", _vlm_feats,
+     PostConfig(**{**asdict(_vlm_post), "use_rover": False, "repair": False})),
+    ("+ ROVER", _vlm_feats, PostConfig(**{**asdict(_vlm_post), "repair": False})),
+    ("+ lexicon repair", _vlm_feats, _vlm_post),
 ]
+if HAS_CTC:
+    ladder.append(("+ kraken CTC member" + ("" if POST.use_ctc else " (rejected)"),
+                   TUNED["vlm+ctc"][2], TUNED["vlm+ctc"][0]))
 rows = []
 prev = None
-for name, pc in ladder:
-    val = oof_score(pc)
+for name, feats_, pc in ladder:
+    val = oof_score(pc, feats_)
     rows.append({"stage": name, "oof_score": round(val, 5),
                  "delta": None if prev is None else round(val - prev, 5)})
     prev = val
 LADDER = pd.DataFrame(rows)
 print(LADDER.to_string(index=False))
 LADDER.to_csv(OUT / "postprocessing_ladder.csv", index=False)
+
+# How much each view and each model adds. If "no photometric" matches "ALL views",
+# set tta_photometric=False in CLI_OVERRIDES (new session not required for that
+# flag). If the two-model row clearly beats either single model, the ensemble is
+# the lever.
+def _subset_score(keep_view=None, keep_model=None):
+    nb = {i: [c for c in cs
+              if (keep_view is None or c["view"] in keep_view)
+              and (keep_model is None or c["model"] in keep_model)]
+          for i, cs in OOF_NBEST.items()}
+    nb = {i: cs for i, cs in nb.items() if cs}
+    ids = [i for i in OOF_IDS if i in nb]
+    feats = build_features(nb, ids, FOLD_OF, restrict=POST.restrict_charset, collapse=POST.collapse)
+    pred = apply_post(feats, ids, POST,
+                      lexicon_for=lambda i: fold_resources(FOLD_OF.get(i, -1))[1])
+    refs = train_df.set_index("ID").loc[ids, "Target"].tolist()
+    return competition_score(refs, [pred[i] for i in ids])
+
+_views = sorted({c["view"] for cs in OOF_NBEST.values() for c in cs})
+_models = sorted({c["model"] for cs in OOF_NBEST.values() for c in cs})
+rows = [("ALL views, ALL models", _subset_score())]
+rows += [(f"view {v} only", _subset_score(keep_view={v})) for v in _views]
+rows += [(f"model {m} only", _subset_score(keep_model={m})) for m in _models]
+rows += [(f"no photometric", _subset_score(keep_view={v for v in _views if v.endswith("identity")}))]
+for name, r in rows:
+    print(f"{name:<28} score {r['score']:.5f}  CER {r['cer']:.4f}  WER {r['wer']:.4f}")
 
 # Error inspection: the worst out-of-fold lines, to decide where to spend next.
 _final_oof = apply_post(OOF_FEATS, OOF_IDS, POST,
@@ -4646,7 +5533,8 @@ def build_pseudo_labels(nbest: dict, min_agreement: float = 1.0,
 
 
 if CFG.use_pseudo_labels:
-    PSEUDO = build_pseudo_labels(TEST_NBEST)
+    PSEUDO = build_pseudo_labels({i: [c for c in v if family_of(c) == "vlm"]
+                                  for i, v in TEST_NBEST.items()})
     print("!! Pseudo-labelling is enabled. Confirm the organisers permit it before "
           "submitting a solution trained this way.")
     # Retrain fold 0 with the pseudo-labelled lines appended, then re-run Section 14.
@@ -4671,7 +5559,10 @@ TEST_FOLD_OF = {i: -1 for i in TEST_IDS}   # -1 => resources built from all of T
 fold_resources(-1)
 
 TEST_FEATS = build_features(TEST_NBEST, TEST_IDS, TEST_FOLD_OF,
-                            restrict=POST.restrict_charset, collapse=POST.collapse)
+                            restrict=POST.restrict_charset, collapse=POST.collapse,
+                            families=POST.families)
+print(f"[submit] members: {' + '.join(POST.families)}"
+      f"{'' if POST.use_ctc or not HAS_CTC else '  (kraken CTC rejected by the OOF gate)'}")
 TEST_PRED = apply_post(TEST_FEATS, TEST_IDS, POST,
                        lexicon_for=lambda i: FOLD_LEX[-1])
 
@@ -4690,7 +5581,9 @@ if submission.Target.isna().any():
 n_empty = int((submission.Target.str.strip() == "").sum())
 if n_empty:
     problems.append(f"{n_empty} empty predictions (scored as fully incorrect)")
-    fallback = top1(TEST_NBEST)
+    # VLM beams only: CTC confidences live on a different scale.
+    fallback = top1({i: [c for c in cands if family_of(c) == "vlm"] or cands
+                     for i, cands in TEST_NBEST.items()})
     mask = submission.Target.str.strip() == ""
     submission.loc[mask, "Target"] = [normalize_text(fallback.get(i, "the")) or "the"
                                       for i in submission.loc[mask, "ID"]]
@@ -4738,11 +5631,17 @@ manifest = {
     "stackmix_enabled": bool(CFG.stackmix),
     "pseudo_labels_used": bool(CFG.use_pseudo_labels),
     "grpo_used": bool(CFG.run_grpo),
+    "ctc_branch": CTC_STATUS,
+    "ctc_model": CFG.ctc_model_id if CFG.ctc_branch else None,
+    "ctc_model_licence": CTC_LICENCE,
+    "ctc_used_in_submission": bool(POST.use_ctc),
+    "ctc_report": CTC_REPORT,
+    "tuned_member_sets": {k: round(v[1], 5) for k, v in TUNED.items()},
     "hub_repo": CFG.hf_repo_id or None,
     "hub_errors": HUB.errors,
 }
 with open(OUT / "run_manifest.json", "w") as fh:
-    json.dump(manifest, fh, indent=2)
+    json.dump(manifest, fh, indent=2, default=str)
 with open(OUT / "post_config.json", "w") as fh:
     json.dump(asdict(POST), fh, indent=2)
 
@@ -4765,6 +5664,8 @@ HUB.write_card(model_card(
         "OOF score (after fusion)": f"{best_val:.5f}",
         "OOF score (raw top-1)": f"{BASELINE['score']:.5f}",
         "weighted CER / WER": f"{BASELINE['cer']:.4f} / {BASELINE['wer']:.4f}",
+        "kraken PP-OCRv6 member": ("used" if POST.use_ctc else "not used")
+                                  + f" ({CTC_STATUS})",
     },
 ))
 
@@ -4783,6 +5684,14 @@ for r in RUNS:
         extra = f"  [grpo {r['grpo_scores']['delta']:+.5f} {kept}]"
     print(f"  {r['tag']:<24} val {r['best']['score']:.5f} "
           f"({r['best']['source']}, step {r['best']['step']}, {r.get('minutes', 0):.0f} min){extra}")
+print(f"kraken CTC branch   {CTC_STATUS}")
+if CTC_REPORT.get("zero_shot"):
+    print(f"  zero-shot PP-OCRv6          {CTC_REPORT['zero_shot']['score']:.5f}")
+if CTC_REPORT.get("oof_top1"):
+    print(f"  fine-tuned CTC top-1 OOF    {CTC_REPORT['oof_top1']['score']:.5f}")
+if "gate_delta" in CTC_REPORT:
+    print(f"  fusion gate                 {'kept' if CTC_REPORT['gate_kept'] else 'dropped'}"
+          f" ({CTC_REPORT['gate_delta']:+.5f} OOF)")
 print(f"OOF before post-processing   {BASELINE['score']:.5f}")
 print(f"OOF after post-processing    {best_val:.5f}   ({best_val - BASELINE['score']:+.5f})")
 print(f"submission                   {SUB_PATH}")
@@ -4799,32 +5708,37 @@ NOTIFY.finished(best_val, BASELINE["score"], SUB_PATH)
 
 # ## 18. Where the remaining points are
 #
-# Ordered by expected gain per GPU-hour, based on the diagnostics printed above.
+# Ordered by expected gain per GPU-hour after the fold-0 run (best step 532/666,
+# post-processing +0.0026, GRPO reward_std ~0.03, EMA ≈ raw).
 #
-# 1. **Train more folds.** Ensembling is the most reliable lever in this pipeline —
-#    each additional fold adds independent hypotheses to the ROVER vote. Go from
-#    `train_folds = (0,)` to all five before tuning anything else.
-# 2. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
+# 1. **Read the view/model ablation table** printed after the post-processing
+#    ladder. If "no photometric" matches "ALL views", set `tta_photometric=False`
+#    in `CLI_OVERRIDES` and save a third of decode time. If two models beat either
+#    one, keep spending on voters rather than on GRPO or rank.
+# 2. **More voters, then continue the first adapter.** `RUN_PLAN` trains
+#    `fold0_seed7` (same val fold, a real two-model OOF) and `full_from42`
+#    (warm-start of fold0_seed42 on every labelled line). Paste the ablation
+#    table before buying another seed.
+# 3. **Resolution, only if time remains.** `line_height=192` with
+#    `max_line_width=3840` needs its *own* session: `CACHE_DIR` is computed once
+#    from CFG at import, and `load_line` reads that directory. Drop
+#    `per_device_batch_size` to 4 and `grad_accum` to 8 so the effective batch
+#    stays 32.
+# 4. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
 #    the N-best list is far above the fused score, the ranking is the bottleneck:
-#    raise `n_best`, add TTA views, and re-run the weight search. If the oracle is
-#    close to the fused score, the *model* is the bottleneck: train longer, raise
-#    `line_height`, or move to a larger backbone.
-# 3. **Resolution.** `line_height` is the single most influential image knob. If VRAM
-#    allows, 192 with `max_line_width = 3840` gives the vision tower noticeably more
-#    signal per character, at roughly 1.4x the step time.
-# 4. **Seed ensembling.** Two seeds on the same fold produce genuinely different error
-#    patterns and fuse almost as well as two different folds, without shrinking the
-#    training set. Run `train_fold(0, tag="fold0_seedB")` with `CFG.seed` changed and
-#    append it to `RUNS`; the ROVER vote picks the diversity up for free.
-# 5. **Mode diversity.** `CFG.finetune_mode = "full"` on a 4B backbone produces a
-#    model that fails differently from the 8B LoRA one. Two *different* models fuse
-#    better than two runs of the same recipe, so this is worth more as an ensemble
-#    member than as a replacement.
-# 6. **GRPO steps.** GRPO is on by default and self-gating, so the question is only
-#    how much of it to buy: `grpo_steps` is the knob, and the printed
-#    `[grpo] SFT x vs GRPO y` line tells you whether more would pay. If the delta is
-#    positive and still growing at 300 steps, raise it.
-# 7. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
+#    raise `n_best` and re-run the weight search. If the oracle is close, the
+#    *model* is the bottleneck.
+# 5. **GRPO is off.** Re-enable it only if a previous verdict tab shows a gain
+#    clearly above +0.005. A delta under that on 320 samples is noise, and
+#    `accepted = delta > 0` would have treated noise as a win.
+# 6. **Do not raise `lora_r`.** Training reward ~0.98 vs held-out ~0.905 is a
+#    generalisation gap, not a capacity problem.
+# 7. **Read the kraken CTC verdict.** The summary prints the zero-shot and
+#    fine-tuned PP-OCRv6 scores and whether the fusion gate kept it. If the
+#    fine-tuned CTC top-1 is within a few thousandths of the VLM, it is a genuine
+#    second opinion. If it is far behind, it still earns its place through the
+#    `c_sim` anchor on the lines where the VLM loops.
+# 8. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
 #    at high aspect ratios, they are being squashed by `max_line_width` and deserve a
 #    dedicated higher-budget decoding pass.
 

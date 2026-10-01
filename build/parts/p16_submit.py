@@ -36,7 +36,8 @@ def build_pseudo_labels(nbest: dict, min_agreement: float = 1.0,
 
 
 if CFG.use_pseudo_labels:
-    PSEUDO = build_pseudo_labels(TEST_NBEST)
+    PSEUDO = build_pseudo_labels({i: [c for c in v if family_of(c) == "vlm"]
+                                  for i, v in TEST_NBEST.items()})
     print("!! Pseudo-labelling is enabled. Confirm the organisers permit it before "
           "submitting a solution trained this way.")
     # Retrain fold 0 with the pseudo-labelled lines appended, then re-run Section 14.
@@ -63,7 +64,10 @@ TEST_FOLD_OF = {i: -1 for i in TEST_IDS}   # -1 => resources built from all of T
 fold_resources(-1)
 
 TEST_FEATS = build_features(TEST_NBEST, TEST_IDS, TEST_FOLD_OF,
-                            restrict=POST.restrict_charset, collapse=POST.collapse)
+                            restrict=POST.restrict_charset, collapse=POST.collapse,
+                            families=POST.families)
+print(f"[submit] members: {' + '.join(POST.families)}"
+      f"{'' if POST.use_ctc or not HAS_CTC else '  (kraken CTC rejected by the OOF gate)'}")
 TEST_PRED = apply_post(TEST_FEATS, TEST_IDS, POST,
                        lexicon_for=lambda i: FOLD_LEX[-1])
 
@@ -82,7 +86,9 @@ if submission.Target.isna().any():
 n_empty = int((submission.Target.str.strip() == "").sum())
 if n_empty:
     problems.append(f"{n_empty} empty predictions (scored as fully incorrect)")
-    fallback = top1(TEST_NBEST)
+    # VLM beams only: CTC confidences live on a different scale.
+    fallback = top1({i: [c for c in cands if family_of(c) == "vlm"] or cands
+                     for i, cands in TEST_NBEST.items()})
     mask = submission.Target.str.strip() == ""
     submission.loc[mask, "Target"] = [normalize_text(fallback.get(i, "the")) or "the"
                                       for i in submission.loc[mask, "ID"]]
@@ -131,11 +137,17 @@ manifest = {
     "stackmix_enabled": bool(CFG.stackmix),
     "pseudo_labels_used": bool(CFG.use_pseudo_labels),
     "grpo_used": bool(CFG.run_grpo),
+    "ctc_branch": CTC_STATUS,
+    "ctc_model": CFG.ctc_model_id if CFG.ctc_branch else None,
+    "ctc_model_licence": CTC_LICENCE,
+    "ctc_used_in_submission": bool(POST.use_ctc),
+    "ctc_report": CTC_REPORT,
+    "tuned_member_sets": {k: round(v[1], 5) for k, v in TUNED.items()},
     "hub_repo": CFG.hf_repo_id or None,
     "hub_errors": HUB.errors,
 }
 with open(OUT / "run_manifest.json", "w") as fh:
-    json.dump(manifest, fh, indent=2)
+    json.dump(manifest, fh, indent=2, default=str)
 with open(OUT / "post_config.json", "w") as fh:
     json.dump(asdict(POST), fh, indent=2)
 
@@ -158,6 +170,8 @@ HUB.write_card(model_card(
         "OOF score (after fusion)": f"{best_val:.5f}",
         "OOF score (raw top-1)": f"{BASELINE['score']:.5f}",
         "weighted CER / WER": f"{BASELINE['cer']:.4f} / {BASELINE['wer']:.4f}",
+        "kraken PP-OCRv6 member": ("used" if POST.use_ctc else "not used")
+                                  + f" ({CTC_STATUS})",
     },
 ))
 
@@ -176,6 +190,14 @@ for r in RUNS:
         extra = f"  [grpo {r['grpo_scores']['delta']:+.5f} {kept}]"
     print(f"  {r['tag']:<24} val {r['best']['score']:.5f} "
           f"({r['best']['source']}, step {r['best']['step']}, {r.get('minutes', 0):.0f} min){extra}")
+print(f"kraken CTC branch   {CTC_STATUS}")
+if CTC_REPORT.get("zero_shot"):
+    print(f"  zero-shot PP-OCRv6          {CTC_REPORT['zero_shot']['score']:.5f}")
+if CTC_REPORT.get("oof_top1"):
+    print(f"  fine-tuned CTC top-1 OOF    {CTC_REPORT['oof_top1']['score']:.5f}")
+if "gate_delta" in CTC_REPORT:
+    print(f"  fusion gate                 {'kept' if CTC_REPORT['gate_kept'] else 'dropped'}"
+          f" ({CTC_REPORT['gate_delta']:+.5f} OOF)")
 print(f"OOF before post-processing   {BASELINE['score']:.5f}")
 print(f"OOF after post-processing    {best_val:.5f}   ({best_val - BASELINE['score']:+.5f})")
 print(f"submission                   {SUB_PATH}")
@@ -193,31 +215,36 @@ NOTIFY.finished(best_val, BASELINE["score"], SUB_PATH)
 # %% [markdown]
 # ## 18. Where the remaining points are
 #
-# Ordered by expected gain per GPU-hour, based on the diagnostics printed above.
+# Ordered by expected gain per GPU-hour after the fold-0 run (best step 532/666,
+# post-processing +0.0026, GRPO reward_std ~0.03, EMA ≈ raw).
 #
-# 1. **Train more folds.** Ensembling is the most reliable lever in this pipeline —
-#    each additional fold adds independent hypotheses to the ROVER vote. Go from
-#    `train_folds = (0,)` to all five before tuning anything else.
-# 2. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
+# 1. **Read the view/model ablation table** printed after the post-processing
+#    ladder. If "no photometric" matches "ALL views", set `tta_photometric=False`
+#    in `CLI_OVERRIDES` and save a third of decode time. If two models beat either
+#    one, keep spending on voters rather than on GRPO or rank.
+# 2. **More voters, then continue the first adapter.** `RUN_PLAN` trains
+#    `fold0_seed7` (same val fold, a real two-model OOF) and `full_from42`
+#    (warm-start of fold0_seed42 on every labelled line). Paste the ablation
+#    table before buying another seed.
+# 3. **Resolution, only if time remains.** `line_height=192` with
+#    `max_line_width=3840` needs its *own* session: `CACHE_DIR` is computed once
+#    from CFG at import, and `load_line` reads that directory. Drop
+#    `per_device_batch_size` to 4 and `grad_accum` to 8 so the effective batch
+#    stays 32.
+# 4. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
 #    the N-best list is far above the fused score, the ranking is the bottleneck:
-#    raise `n_best`, add TTA views, and re-run the weight search. If the oracle is
-#    close to the fused score, the *model* is the bottleneck: train longer, raise
-#    `line_height`, or move to a larger backbone.
-# 3. **Resolution.** `line_height` is the single most influential image knob. If VRAM
-#    allows, 192 with `max_line_width = 3840` gives the vision tower noticeably more
-#    signal per character, at roughly 1.4x the step time.
-# 4. **Seed ensembling.** Two seeds on the same fold produce genuinely different error
-#    patterns and fuse almost as well as two different folds, without shrinking the
-#    training set. Run `train_fold(0, tag="fold0_seedB")` with `CFG.seed` changed and
-#    append it to `RUNS`; the ROVER vote picks the diversity up for free.
-# 5. **Mode diversity.** `CFG.finetune_mode = "full"` on a 4B backbone produces a
-#    model that fails differently from the 8B LoRA one. Two *different* models fuse
-#    better than two runs of the same recipe, so this is worth more as an ensemble
-#    member than as a replacement.
-# 6. **GRPO steps.** GRPO is on by default and self-gating, so the question is only
-#    how much of it to buy: `grpo_steps` is the knob, and the printed
-#    `[grpo] SFT x vs GRPO y` line tells you whether more would pay. If the delta is
-#    positive and still growing at 300 steps, raise it.
-# 7. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
+#    raise `n_best` and re-run the weight search. If the oracle is close, the
+#    *model* is the bottleneck.
+# 5. **GRPO is off.** Re-enable it only if a previous verdict tab shows a gain
+#    clearly above +0.005. A delta under that on 320 samples is noise, and
+#    `accepted = delta > 0` would have treated noise as a win.
+# 6. **Do not raise `lora_r`.** Training reward ~0.98 vs held-out ~0.905 is a
+#    generalisation gap, not a capacity problem.
+# 7. **Read the kraken CTC verdict.** The summary prints the zero-shot and
+#    fine-tuned PP-OCRv6 scores and whether the fusion gate kept it. If the
+#    fine-tuned CTC top-1 is within a few thousandths of the VLM, it is a genuine
+#    second opinion. If it is far behind, it still earns its place through the
+#    `c_sim` anchor on the lines where the VLM loops.
+# 8. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
 #    at high aspect ratios, they are being squashed by `max_line_width` and deserve a
 #    dedicated higher-budget decoding pass.

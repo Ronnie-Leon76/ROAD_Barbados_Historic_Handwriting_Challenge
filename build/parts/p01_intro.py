@@ -29,15 +29,20 @@
 # 6. **GRPO stage** that optimises the competition metric directly as a reward on top
 #    of the SFT checkpoint. On by default and self-gating: the polished weights are
 #    scored against their parent on held-out data and discarded unless they win.
-# 7. **Reproducibility and checkpoint custody**: deterministic kernels, per-sample
+# 7. **A second, CTC recogniser**: kraken's PP-OCRv6 port (15.9M parameters,
+#    Apache-2.0) fine-tuned per fold in its own virtualenv. It cannot loop or
+#    hallucinate the way an autoregressive decoder can, so it joins the ROVER vote
+#    and anchors the rescoring — and, like GRPO, it is kept only if it wins
+#    out-of-fold (`Section 14.1`).
+# 8. **Reproducibility and checkpoint custody**: deterministic kernels, per-sample
 #    seeding, a run fingerprint over the input files and library versions, and
 #    optional mirroring of every checkpoint and artefact to the Hugging Face Hub —
 #    so a run can be replayed, or resumed on a fresh pod, to the same score.
-# 8. **Unattended operation**: the same cells build `run_pipeline.py`, a headless
+# 9. **Unattended operation**: the same cells build `run_pipeline.py`, a headless
 #    script that logs to file, streams TensorBoard curves (locally and to the hub),
 #    and emails you on every checkpoint upload, GRPO verdict, completion and
 #    failure. See `python build/build_script.py` and `./run_background.sh`.
-# 9. **Legible progress**: stage banners with elapsed wall clock, a `tqdm` bar on
+# 10. **Legible progress**: stage banners with elapsed wall clock, a `tqdm` bar on
 #    every long loop and a training heartbeat with a projected finish time — throttled
 #    automatically when the output is a log file rather than a terminal (`Section 2.6`).
 #
@@ -47,6 +52,15 @@
 # longer references carry more weight. The metric is re-implemented in
 # `Section 4` and unit-tested, so local validation numbers are directly comparable
 # to the leaderboard.
+#
+# ## How to actually win (read this before training another 8B fold-0)
+#
+# The 0.905 public score trained **one fold**. GRPO added 0.0004. First place is
+# 0.940. Do not swap to dots.ocr (custom licence) or chase another VLM from the
+# BHL printed-book board. Set `CFG.competition_mode = True` (the default): all
+# five folds of this Qwen pipeline **and** the kraken CTC branch. Then run
+# `ROAD_Barbados_Kraken_PP_OCRv6.ipynb` on a **separate** kernel and submit
+# both files plus the ensemble. Email alerts fire in both notebooks from `.env`.
 
 # %% [markdown]
 # ## 0. Rules compliance — read before changing model or data settings
@@ -72,16 +86,14 @@
 #
 # On RunPod choose a **PyTorch 2.6+ / CUDA 12.4+** template. If the base image ships
 # an older torch, the cell prints a warning instead of silently producing a broken
-# environment.
+# environment. FlashAttention-2 is installed from a prebuilt wheel with the pip
+# cache disabled so a `/tmp` vs `/workspace` split cannot raise EXDEV; if no
+# matching wheel exists the model falls back to SDPA and training still runs.
 #
-# To mirror checkpoints to the Hugging Face Hub, set a **write** token before running
-# `Section 2.3` — on RunPod the cleanest way is a pod secret, so the token never
-# reaches the notebook file:
-#
-# ```python
-# import os; os.environ["HF_TOKEN"] = "hf_..."   # or set it in the pod environment
-# CFG.hf_repo_id = "your-name/road-barbados-htr"
-# ```
+# To mirror checkpoints to the Hugging Face Hub, export a **write** token in the
+# pod environment (or gitignored `.env`) *before* running `Section 2.3`. Do not
+# paste it into a notebook cell — that is how tokens end up in checkpoints and
+# git history. Section 2.3 asserts the token is present and sets the repo id.
 
 # %%
 import os as _os
@@ -95,10 +107,18 @@ INSTALL_FLASH_ATTENTION = RUN_INSTALL   # falls back to SDPA if the wheel fails
 if RUN_INSTALL:
     import subprocess
     import sys
+    from pathlib import Path
 
-    def pip(*args: str) -> None:
+    def pip(*args: str, extra_env: dict | None = None, cwd: str | None = None) -> int:
         print("pip", *args)
-        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *args], check=False)
+        env = None
+        if extra_env:
+            env = _os.environ.copy()
+            env.update(extra_env)
+        return subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *args],
+            check=False, env=env, cwd=cwd,
+        ).returncode
 
     pip("--upgrade", "pip")
     pip(
@@ -125,9 +145,80 @@ if RUN_INSTALL:
         "pyyaml",
         "tensorboard>=2.16",
     )
+
+    def _flash_attn_ok() -> bool:
+        try:
+            import flash_attn  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def _download_flash_attn_wheel(dest_dir: Path) -> Path | None:
+        """Fetch the same GitHub wheel flash-attn's setup.py would have guessed."""
+        try:
+            import torch
+            import urllib.request
+        except Exception:
+            return None
+        if sys.platform != "linux":
+            return None
+        py = f"cp{sys.version_info.major}{sys.version_info.minor}"
+        torch_mm = ".".join(torch.__version__.split("+")[0].split(".")[:2])
+        try:
+            abi = "TRUE" if bool(torch._C._GLIBCXX_USE_CXX11_ABI) else "FALSE"
+        except Exception:
+            abi = "TRUE"
+        for ver in ("2.8.3.post1", "2.8.3", "2.8.2", "2.7.4.post1", "2.7.3"):
+            name = (f"flash_attn-{ver}+cu12torch{torch_mm}cxx11abi{abi}"
+                    f"-{py}-{py}-linux_x86_64.whl")
+            url = ("https://github.com/Dao-AILab/flash-attention/releases/"
+                   f"download/v{ver}/{name}")
+            path = dest_dir / name.replace("+", "-")
+            print(f"[env] trying {url}")
+            try:
+                urllib.request.urlretrieve(url, path)
+                if path.stat().st_size > 1_000_000:
+                    return path
+            except Exception as exc:
+                print(f"[env]   {exc}")
+            path.unlink(missing_ok=True)
+        return None
+
+    def install_flash_attn() -> None:
+        """Install a prebuilt wheel without crossing filesystems.
+
+        flash-attn downloads a matching GitHub wheel, then pip `os.rename`s it
+        into its cache. On rented pods /tmp and /workspace are often different
+        mounts, which raises EXDEV (errno 18) and looks like a failed source
+        build even though a good wheel was just fetched. Keep temp files on the
+        workspace, skip the pip wheel cache, and never fall through to a CUDA
+        compile (~40 minutes on a pod).
+        """
+        if _flash_attn_ok():
+            print("[env] flash-attn already installed")
+            return
+        root = Path.cwd() / ".cache"
+        tmp = root / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        env = {
+            "TMPDIR": str(tmp), "TEMP": str(tmp), "TMP": str(tmp),
+            "FLASH_ATTENTION_SKIP_CUDA_BUILD": "TRUE",
+        }
+        rc = pip("flash-attn>=2.7.0", "--no-build-isolation", "--no-cache-dir",
+                 extra_env=env, cwd=str(tmp))
+        if rc == 0 or _flash_attn_ok():
+            print("[env] flash-attn installed")
+            return
+        wheel = _download_flash_attn_wheel(tmp)
+        if wheel is not None and (pip(str(wheel), extra_env=env, cwd=str(tmp)) == 0
+                                  or _flash_attn_ok()):
+            print(f"[env] flash-attn installed from {wheel.name}")
+            return
+        print("[env] flash-attn unavailable; attention will use SDPA. "
+              "Training still runs, just uses more VRAM per step.")
+
     if INSTALL_FLASH_ATTENTION:
-        # Prebuilt wheels only; a source build on a rented pod costs ~40 minutes.
-        pip("flash-attn>=2.7.0", "--no-build-isolation")
+        install_flash_attn()
 
 # %%
 import gc

@@ -86,7 +86,8 @@ def build_fingerprint(cfg: Config) -> dict:
     # are excluded so that pushing to a different repo does not invalidate a match.
     volatile = {"hf_repo_id", "hf_private", "hf_push_checkpoints", "hf_push_submission",
                 "hf_resume", "hf_token_env", "work_dir", "data_dir", "out_dir",
-                "dataloader_workers", "infer_batch_size"}
+                "dataloader_workers", "infer_batch_size",
+                "ctc_venv", "ctc_torch_index", "ctc_infer_batch"}
     material = {k: v for k, v in asdict(cfg).items() if k not in volatile}
     config_hash = hashlib.sha256(
         json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()[:16]

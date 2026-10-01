@@ -277,6 +277,15 @@ if ARGS.email:
 # longer references carry more weight. The metric is re-implemented in
 # `Section 4` and unit-tested, so local validation numbers are directly comparable
 # to the leaderboard.
+#
+# ## How to actually win (read this before training another 8B fold-0)
+#
+# The 0.905 public score trained **one fold**. GRPO added 0.0004. First place is
+# 0.940. Do not swap to dots.ocr (custom licence) or chase another VLM from the
+# BHL printed-book board. Set `CFG.competition_mode = True` (the default): all
+# five folds of this Qwen pipeline **and** the kraken CTC branch. Then run
+# `ROAD_Barbados_Kraken_PP_OCRv6.ipynb` on a **separate** kernel and submit
+# both files plus the ensemble. Email alerts fire in both notebooks from `.env`.
 
 # ## 0. Rules compliance — read before changing model or data settings
 #
@@ -304,14 +313,10 @@ if ARGS.email:
 # cache disabled so a `/tmp` vs `/workspace` split cannot raise EXDEV; if no
 # matching wheel exists the model falls back to SDPA and training still runs.
 #
-# To mirror checkpoints to the Hugging Face Hub, set a **write** token before running
-# `Section 2.3` — on RunPod the cleanest way is a pod secret, so the token never
-# reaches the notebook file:
-#
-# ```python
-# import os; os.environ["HF_TOKEN"] = "hf_..."   # or set it in the pod environment
-# CFG.hf_repo_id = "your-name/road-barbados-htr"
-# ```
+# To mirror checkpoints to the Hugging Face Hub, export a **write** token in the
+# pod environment (or gitignored `.env`) *before* running `Section 2.3`. Do not
+# paste it into a notebook cell — that is how tokens end up in checkpoints and
+# git history. Section 2.3 asserts the token is present and sets the repo id.
 
 import os as _os
 
@@ -522,15 +527,32 @@ def vram_report(tag: str = "") -> None:
 # One object controls the whole run. Defaults are auto-scaled to the detected GPU:
 # an 8B backbone in bf16 on >= 40 GB cards, a 4B backbone or 4-bit QLoRA on smaller
 # ones. Every downstream cell reads from `CFG`, so a single edit here is enough to
-# change the experiment.
+# change the experiment. Session knobs go in the `CLI_OVERRIDES` cell immediately
+# below; `run_pipeline.py --set` merges on top of them.
 #
 # Three switches change the shape of the run rather than a hyperparameter:
 #
 # | Switch | Effect |
 # |---|---|
+# | `competition_mode` | **Leaderboard recipe**: all five folds + the kraken CTC branch. `--fast` and `--folds` still override it |
 # | `finetune_mode` | `"lora"` adapters (default) or `"full"` — every weight trained, with the learning rate, optimiser, batch shape and EMA re-derived to match |
-# | `run_grpo` | RL polish that optimises the leaderboard metric directly, kept only if it beats the SFT adapter out-of-fold |
+# | `run_grpo` | RL polish on the leaderboard metric. Off by default: with this data the 6 samples/image are nearly identical, so the advantages are noise |
 # | `hf_repo_id` | mirrors every checkpoint and artefact to the Hugging Face Hub so the run can be replayed exactly |
+
+# Session knobs. argparse / `run_pipeline.py --set` merge on top (CLI wins).
+# Resolution is commented out on purpose: CACHE_DIR is computed once at import
+# from CFG.line_height / max_line_width, so a high-res run needs its own session.
+CLI_OVERRIDES = {
+    **dict(
+        run_grpo=False,
+        # --- high-res variant: run in its OWN session (cache dir is fixed at import) ---
+        # line_height=192, max_line_width=3840,
+        # per_device_batch_size=4, grad_accum=8,   # same effective batch of 32, avoids OOM
+        # --- only after the view ablation (Section 15) says dark/light add nothing ---
+        # tta_photometric=False,
+    ),
+    **globals().get("CLI_OVERRIDES", {}),
+}
 
 def load_dotenv(path: str | Path = ".env") -> list:
     """Minimal .env loader. Existing environment variables always win.
@@ -595,7 +617,11 @@ class Config:
 
     # --------------------------------------------------------------- splits --
     n_folds: int = 5
-    train_folds: tuple = (0,)              # which folds to actually train
+    # One fold is a plumbing check (the 0.905 public score). A leaderboard run
+    # needs every fold: that is the largest unused lever in this pipeline.
+    train_folds: tuple = (0,)
+    competition_mode: bool = True          # True -> all n_folds + CTC branch
+                                           # (--fast / CLI --folds still win)
     fold_seed: int = 20260703
 
     # ------------------------------------------------------------- training --
@@ -681,10 +707,10 @@ class Config:
     lm_tune_iters: int = 400
 
     # ------------------------------------------------------- optional stages --
-    # GRPO optimises the leaderboard metric directly. It is on, but gated: the
-    # polished adapter is scored against the SFT one on held-out data and is only
-    # kept if it wins, so enabling it cannot make the submission worse.
-    run_grpo: bool = True
+    # GRPO optimises the leaderboard metric directly. It is off: on this data the
+    # 6 samples per image are nearly identical (reward_std ~0.02–0.04), so the
+    # advantages are noise. Re-enable only if the verdict tab shows a real gain.
+    run_grpo: bool = False
     grpo_steps: int = 300
     grpo_num_generations: int = 6
     grpo_lr: float = 2e-6
@@ -832,6 +858,10 @@ def apply_finetune_mode(cfg: Config, vram_gb: float) -> Config:
 # then win over them, and the mode/quantisation derivations run last so they see
 # the settings that will actually be used.
 CFG = autoscale(CFG, GPU_VRAM_GB)
+if CFG.competition_mode:
+    CFG.train_folds = tuple(range(CFG.n_folds))
+    CFG.ctc_branch = True
+    print(f"[cfg] COMPETITION MODE: CTC on folds {CFG.train_folds}; VLM runs follow RUN_PLAN")
 if not CFG.hf_repo_id:
     CFG.hf_repo_id = os.environ.get("HF_REPO_ID", "").strip()
 
@@ -1091,12 +1121,21 @@ print("[repro] versions      " + ", ".join(
 # | `post_config.json` | after tuning | the fusion weights, which move the score by more than a training epoch |
 # | `submission.csv`, `run_manifest.json` | at the end | the exact rows that were scored |
 #
-# Going the other way, `CFG.hf_resume = True` pulls the checkpoints back down and
-# skips training entirely, which turns a four-hour run into a decoding-only pass —
-# useful for re-tuning post-processing without paying for the GPU hours again.
+# Going the other way, `CFG.hf_resume = True` pulls existing checkpoints (and
+# Section 14 pulls `preds/**`) so `RUN_PLAN` can skip tags that already exist and
+# only train the missing voters.
 #
-# Nothing here is required: with `hf_repo_id` empty every call is a no-op and the
-# notebook behaves exactly as before.
+# Export `$HF_TOKEN` in the pod environment; do not paste it into a cell.
+
+# Never paste a token into this cell. Export HF_TOKEN in the pod env or .env.
+assert os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") \
+    or os.environ.get("ROAD_HEADLESS") == "1", \
+    "export HF_TOKEN in the pod env / .env first"
+# The trained fold0 adapter lives here (val 0.90477 @ step 532). A different
+# HF_REPO_ID in .env would resume from an empty/wrong repo.
+CFG.hf_repo_id = "Ronochieng/road-barbados-htr"
+CFG.hf_resume = True     # pull fold0_seed42 (and preds) instead of retraining it
+print(f"[hub] repo={CFG.hf_repo_id}  resume={CFG.hf_resume}")
 
 class HubSync:
     """Thin, failure-tolerant wrapper around huggingface_hub uploads.
@@ -1292,7 +1331,7 @@ class Notifier:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.to = os.environ.get("NOTIFY_EMAIL_TO", "").strip()
-        self.host = os.environ.get("SMTP_HOST", "").strip()
+        self.host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
         self.port = int(os.environ.get("SMTP_PORT", "587") or 587)
         self.user = os.environ.get("SMTP_USER", "").strip()
         self.password = os.environ.get("SMTP_PASSWORD", "").strip()
@@ -3494,9 +3533,9 @@ def nbest_to_frame(nbest: dict) -> pd.DataFrame:
 # prior — and note that the two modes make *different* errors, so a LoRA fold and a
 # full-fine-tune fold fuse well together in the ROVER vote.
 #
-# The middle option, and the one worth reaching for first if LoRA looks
-# capacity-limited, is not full fine-tuning but a larger rank: `lora_r = 64` with
-# `lora_alpha = 128` roughly doubles adapter capacity for a few GB.
+# A larger rank (`lora_r = 64`) is the wrong next step on this data: training
+# reward is already ~0.98 against ~0.905 held-out, which is a generalisation gap.
+# More seeds and more labelled lines beat more adapter capacity.
 
 from transformers import Trainer, TrainingArguments, TrainerCallback
 from transformers.trainer_pt_utils import LengthGroupedSampler
@@ -3765,7 +3804,10 @@ def make_training_args(cfg: Config, out_dir: Path, steps_per_epoch: int,
 
 def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
                train_override: pd.DataFrame | None = None,
-               val_override: pd.DataFrame | None = None) -> dict:
+               val_override: pd.DataFrame | None = None,
+               adapter_path: str | Path | None = None) -> dict:
+    """Train one adapter. `adapter_path` warm-starts from an existing LoRA instead
+    of initialising a new one on the base model."""
     cfg = cfg or CFG
     tag = tag or f"fold{fold}_seed{cfg.seed}"
     tr_df, va_df = fold_frames(fold)
@@ -3794,17 +3836,23 @@ def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
     print(f"[train] mode {cfg.finetune_mode} | seed {cfg.seed} | "
           f"determinism {'on' if cfg.deterministic else 'off'}")
     print(f"[train] cosine annealing: warmup {cfg.warmup_ratio:.0%}, floor {cfg.min_lr_ratio:.0%}"
-          f" of peak lr {cfg.lr:g}\n{'='*78}")
+          f" of peak lr {cfg.lr:g}")
+    if adapter_path:
+        print(f"[train] warm-start from {adapter_path}")
+    print("=" * 78)
 
     tb = TBLogger(tag, enabled=cfg.tensorboard)
     tb.text("config", "```json\n" + json.dumps(
         {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(cfg).items()},
         indent=2) + "\n```")
 
-    model = build_model(cfg, for_training=True)
+    model = build_model(cfg, adapter_path=adapter_path, for_training=True)
     args = make_training_args(cfg, OUT / "checkpoints" / tag, steps_per_epoch, tb.dir)
 
-    ema = AdapterEMA(model, cfg.ema_decay) if cfg.ema_decay and cfg.ema_decay > 0 else None
+    # warmup_steps=4 -> decay (1+n)/(5+n), a running average over roughly the last
+    # quarter of a 666-step run. The class default of 20 never reaches cfg.ema_decay
+    # (0.999) in that many steps, which is why raw and EMA scored the same.
+    ema = AdapterEMA(model, cfg.ema_decay, warmup_steps=4) if cfg.ema_decay and cfg.ema_decay > 0 else None
     val_cb = GenerationEvalCallback(model, PROCESSOR, cfg, va_df, eval_every,
                                     OUT / "checkpoints", ema=ema,
                                     max_samples=cfg.eval_max_samples, tag=tag, tb=tb)
@@ -3852,73 +3900,172 @@ def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
 
 # ## 12. Run training
 #
-# `CFG.train_folds` controls the budget. Guidance for a single 48 GB card:
+# Fold-0 already peaked at step 532 of 666 (val 0.90477, raw). More epochs on that
+# same run will not help. We **pull those LoRA weights** from the hub and continue
+# from them:
 #
-# | Setting | Wall clock | Use for |
+# * `fold0_seed42` is restored, never retrained.
+# * `full_from42` warm-starts that adapter on every labelled line, at a lower LR,
+#   so the extra ~25% of data can move the weights without wiping the first run.
+# * `fold0_seed7` is a *new* adapter on the same val fold. Fusion needs a second
+#   error pattern; continuing seed-42 a second time would not give it one.
+#
+# Tags that already exist on the hub or in `runs.json` are skipped.
+#
+# Budget on a 48 GB card, including decode:
+#
+# | Tag | Wall clock | Role |
 # |---|---|---|
-# | `train_folds = (0,)` | ~45 min | first end-to-end pass, sanity check |
-# | `train_folds = (0, 1, 2)` | ~2.5 h | ensembling starts paying off here |
-# | `train_folds = (0, 1, 2, 3, 4)` | ~4 h | full out-of-fold coverage for tuning |
+# | `fold0_seed42` | restored | first voter, pulled from the hub |
+# | `fold0_seed7` | ~3 h | second voter, same validation fold, from scratch |
+# | `full_from42` | ~1.5 h | continue seed-42 on all labelled lines |
 #
-# Each fold writes only its best adapter (selected on generation CER/WER, not loss),
-# so disk stays bounded regardless of how many evaluations run. Each fold is also
-# pushed to the hub the moment it finishes, so an interrupted run loses at most the
-# fold that was in flight.
-#
-# With `CFG.hf_resume = True` this cell downloads a previous run's checkpoints
-# instead of training and jumps straight to decoding — the same weights, therefore
-# the same score, without repeating the GPU hours.
+# High-res (`line_height=192`) is a *different* session: `CACHE_DIR` is fixed at
+# import by `load_line`. Do not uncomment those `CLI_OVERRIDES` here.
+
+import dataclasses
+
+RUN_PLAN = [
+    dict(tag="fold0_seed42", fold=0),                          # restored from hub
+    dict(tag="fold0_seed7",  fold=0, over=dict(seed=7)),       # 2nd voter, from scratch
+    dict(tag="full_from42",  fold=0,                           # continue fold0_seed42
+         over=dict(seed=42, epochs=2.0, lr=4e-5),
+         init_from="fold0_seed42"),
+]
 
 RUN_TRAINING = True     # set False to reuse artifacts/runs.json from a previous pass
-RUNS: list[dict] = []
+
+
+def _is_checkpoint_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        (path / "adapter_config.json").exists()
+        or any(path.glob("adapter_model*.safetensors"))
+        or any(path.glob("*.safetensors"))
+    )
+
+
+def _fill_val_ids(run: dict) -> dict:
+    if run.get("val_ids"):
+        return run
+    fold = int(run.get("fold", 0))
+    try:
+        _, va = fold_frames(fold)
+        run["val_ids"] = va["ID"].tolist()
+    except Exception:
+        run["val_ids"] = []
+    return run
+
+
+def _synthesize_run(tag: str, path: Path) -> dict:
+    fold = 0
+    m = re.match(r"fold(\d+)_", tag)
+    if m:
+        fold = int(m.group(1))
+    run = {
+        "tag": tag,
+        "fold": fold,
+        "best": {"path": str(path), "score": float("nan"), "source": "hub", "step": None},
+        "history": pd.DataFrame(),
+        "seed": CFG.seed,
+        "finetune_mode": CFG.finetune_mode,
+    }
+    print(f"[hub] synthesized run record for {tag} <- {path}")
+    return _fill_val_ids(run)
 
 
 def restore_runs_from_hub() -> list:
-    """Pull a previous run's checkpoints back down so decoding can start immediately."""
+    """Pull fold0_seed42 (and any later voters) so we can continue instead of retrain."""
     local = OUT / "hub_restore"
     root = HUB.pull(["runs.json", "checkpoints/**", "history/**"], local)
     if root is None:
         print("[hub] nothing restored - falling back to local artefacts")
         return []
-    with open(Path(root) / "runs.json") as fh:
-        runs = json.load(fh)
-    for r in runs:
-        tag = r["tag"]
-        # Rewrite the recorded paths onto whatever this machine calls them.
-        for key, remote in (("best", f"checkpoints/{tag}"),
-                            ("grpo", f"checkpoints/grpo_fold{r['fold']}")):
-            path = Path(root) / remote
-            if not path.exists():
+    root = Path(root)
+    runs: list = []
+    runs_path = root / "runs.json"
+    if runs_path.exists():
+        with open(runs_path) as fh:
+            runs = json.load(fh)
+        for r in runs:
+            tag = r["tag"]
+            for key, remote in (("best", f"checkpoints/{tag}"),
+                                ("grpo", f"checkpoints/grpo_fold{r.get('fold', 0)}")):
+                path = root / remote
+                if not path.exists():
+                    continue
+                if key == "best":
+                    r.setdefault("best", {})["path"] = str(path)
+                else:
+                    r["grpo_path"] = str(path)
+            hist = root / "history" / f"val_history_{tag}.csv"
+            r["history"] = pd.read_csv(hist) if hist.exists() else pd.DataFrame()
+            _fill_val_ids(r)
+    known = {r["tag"] for r in runs}
+    ckpt_root = root / "checkpoints"
+    if ckpt_root.exists():
+        for d in sorted(ckpt_root.iterdir()):
+            if d.name in known or not _is_checkpoint_dir(d):
                 continue
-            if key == "best":
-                r["best"]["path"] = str(path)
-            else:
-                r["grpo_path"] = str(path)
-        hist = Path(root) / "history" / f"val_history_{tag}.csv"
-        r["history"] = pd.read_csv(hist) if hist.exists() else pd.DataFrame()
-    print(f"[hub] restored {len(runs)} runs from {HUB.repo_id}")
+            runs.append(_synthesize_run(d.name, d))
+    if not runs:
+        print("[hub] snapshot had no usable checkpoints - falling back to local artefacts")
+        return []
+    print(f"[hub] restored {len(runs)} run(s) from {HUB.repo_id}: "
+          + ", ".join(r["tag"] for r in runs))
     return runs
 
 
-if CFG.hf_resume:
-    RUNS = restore_runs_from_hub()
-    RUN_TRAINING = not RUNS      # only train if the restore came back empty
+def _load_local_runs() -> list:
+    path = OUT / "runs.json"
+    if not path.exists():
+        return []
+    with open(path) as fh:
+        runs = json.load(fh)
+    print(f"[runs] restored {len(runs)} runs from disk")
+    return runs
 
-if RUN_TRAINING:
-    stage(f"training {len(CFG.train_folds)} fold(s), mode {CFG.finetune_mode}")
-    NOTIFY.run_started()
-    _folds = progress(CFG.train_folds, desc="folds", unit="fold")
-    for fold in _folds:
-        RUNS.append(train_fold(fold))
-        _folds.set_postfix_str(f"best {RUNS[-1]['best']['score']:.5f}", refresh=False)
-    _folds.close()
+
+RUNS = restore_runs_from_hub() if CFG.hf_resume else []
+if not RUNS:
+    RUNS = _load_local_runs()
+_done = {r["tag"] for r in RUNS}
+
+
+def _save_runs():
     with open(OUT / "runs.json", "w") as fh:
         json.dump([{k: v for k, v in r.items() if k != "history"} for r in RUNS], fh, indent=2)
-    HUB.push_file(OUT / "runs.json", "runs.json", "record fold results")
+    HUB.push_file(OUT / "runs.json", "runs.json", "record runs")
+
+
+if RUN_TRAINING:
+    stage(f"training {len(RUN_PLAN)} run(s)")
+    if any(spec["tag"] not in _done for spec in RUN_PLAN):
+        NOTIFY.run_started()
+    for spec in RUN_PLAN:
+        if spec["tag"] in _done:
+            print(f"[runs] {spec['tag']} already trained - skipping")
+            continue
+        cfg = dataclasses.replace(CFG, **spec.get("over", {}))
+        kw = {}
+        if spec["tag"].startswith("full_"):
+            # Train on every labelled line. The 64-line "val" is only a sanity check;
+            # it sits inside the training set, so checkpoint selection is meaningless here.
+            kw = dict(train_override=train_df[["ID", "Target"]],
+                      val_override=train_df.sample(64, random_state=0)[["ID", "Target"]])
+        parent = spec.get("init_from")
+        if parent:
+            src = next((r for r in RUNS if r["tag"] == parent), None)
+            path = Path(src["best"]["path"]) if src and src.get("best", {}).get("path") else None
+            if path is None or not path.exists():
+                raise SystemExit(f"[runs] {spec['tag']} needs {parent} on disk first "
+                                 f"(hub resume failed to pull it)")
+            kw["adapter_path"] = path
+            print(f"[runs] {spec['tag']} continues from {parent} ({path})")
+        RUNS.append(train_fold(spec["fold"], cfg=cfg, tag=spec["tag"], **kw))
+        _done.add(spec["tag"])
+        _save_runs()
 elif not RUNS:
-    with open(OUT / "runs.json") as fh:
-        RUNS = json.load(fh)
-    print(f"[runs] restored {len(RUNS)} runs from disk")
+    RUNS = _load_local_runs()
 
 for r in RUNS:
     print(f"  {r['tag']:<24} best {r['best']['score']:.5f} ({r['best']['source']}) "
@@ -3952,18 +4099,16 @@ if RUNS and isinstance(RUNS[0].get("history"), pd.DataFrame) and len(RUNS[0]["hi
 # **competition metric as the reward**, and pushing probability mass towards the
 # candidates that beat their group's average.
 #
-# This stage is on by default, but it is the highest-variance part of the notebook:
-# it needs a working TRL vision-language `GRPOTrainer`, every step samples `G`
-# completions so it is slow, and a bad reward scale can undo the SFT gains. Three
-# guards make it safe to leave enabled:
+# This stage is **off** by default. On the fold-0 run the 6 samples per image were
+# nearly identical (`reward_std` 0.02–0.04), so the advantages are noise on 320
+# validation lines. Re-enable `run_grpo` in `CLI_OVERRIDES` only if you have a
+# verdict-tab gain clearly above +0.005. Three guards still apply if you do:
 #
 # * **A KL leash** (`beta = 0.02`) back to the SFT policy, so it polishes rather than
 #   wanders.
 # * **A tiny learning rate** (`2e-6`), two orders below the SFT rate.
-# * **An acceptance test.** The polished adapter is decoded on held-out data from the
-#   same fold and compared with the SFT adapter that produced it. If it does not win,
-#   it is discarded and the SFT adapter continues to the decoding stage. Turning GRPO
-#   on therefore cannot make the submission worse — only slower.
+# * **An acceptance test** with a 0.004 margin (320-sample noise is about ±0.003).
+#   If the polished adapter does not beat SFT by that much, it is discarded.
 #
 # The gate is the important part. Competitors reported real gains from GRPO on this
 # leaderboard, but an ungated RL stage is precisely the kind of thing that silently
@@ -4100,7 +4245,9 @@ def grpo_stage(run: dict, cfg: Config = None) -> dict:
     tb.scalars({"sft": sft_score, "grpo": grpo_score, "delta": delta}, 0, prefix="verdict/")
     tb.close()
 
-    accepted = delta > 0
+    # 320-sample noise is about ±0.003; treating any positive delta as a win
+    # accepts noise. Require a margin that is larger than that.
+    accepted = delta > 0.004
     if accepted:
         run["grpo_path"] = grpo_path
         print(f"[grpo] fold {fold}: ACCEPTED, decoding will use the polished weights")
@@ -4116,9 +4263,14 @@ def grpo_stage(run: dict, cfg: Config = None) -> dict:
 
 if CFG.run_grpo and RUNS:
     stage("GRPO polish + acceptance test")
-    RUNS = [grpo_stage(r) for r in progress(RUNS, desc="grpo", unit="fold")]
+    _todo = [r for r in RUNS if not r["tag"].startswith("full_")]
+    _skipped = [r for r in RUNS if r["tag"].startswith("full_")]
+    _todo = [grpo_stage(r) for r in progress(_todo, desc="grpo", unit="fold")]
+    RUNS = _todo + _skipped
     _kept = sum("grpo_path" in r for r in RUNS)
-    print(f"\n[grpo] {_kept}/{len(RUNS)} folds improved and will decode with GRPO weights")
+    print(f"\n[grpo] {_kept}/{len(_todo)} fold models improved and will decode with GRPO weights")
+    if _skipped:
+        print(f"[grpo] skipped {len(_skipped)} all-data run(s) (leaky val)")
 else:
     print("[grpo] disabled (CFG.run_grpo = False)")
 
@@ -4134,9 +4286,10 @@ else:
 # views; those pooled lists are the input to the fusion stage.
 #
 # Cost control: the number of forward passes is
-# `folds x (len(scales) + 2 if photometric) x beams`. On a 48 GB card, one adapter
+# `models x (len(scales) + 2 if photometric) x beams`. On a 48 GB card, one adapter
 # over the 1 374 test images with 4 views and 5 beams takes roughly an hour. Set
-# `FAST_DECODE = True` for a single greedy view while iterating.
+# `FAST_DECODE = True` for a single greedy view while iterating. Predictions are
+# pulled from / pushed to the hub so a dead pod does not redo 1–2 hours per adapter.
 
 FAST_DECODE = False
 
@@ -4184,6 +4337,8 @@ def decode_run(run: dict, cfg: Config = None, force: bool = False) -> dict:
                               photometric=DECODE_PHOTOMETRIC, **DECODE_KW)
     save_nbest(oof, oof_path)
     save_nbest(test, test_path)
+    HUB.push_file(oof_path, f"preds/{oof_path.name}", f"decoded {tag} oof")
+    HUB.push_file(test_path, f"preds/{test_path.name}", f"decoded {tag} test")
 
     del engine, model
     free_gpu()
@@ -4197,13 +4352,17 @@ def decode_run(run: dict, cfg: Config = None, force: bool = False) -> dict:
 
 
 stage("decode out-of-fold + test")
+HUB.pull(["preds/**"], OUT)
 DECODES = [decode_run(r) for r in progress(RUNS, desc="adapters", unit="model")]
+HUB.push_folder(OUT / "preds", "preds", "decoded n-best lists")
 
-# Assemble the out-of-fold table. With every fold trained this covers the whole
-# training set; with a subset it covers those folds only - still enough to tune the
-# post-processing, just noisier.
+# Assemble the out-of-fold table. All-data models are excluded: their "validation"
+# lines sat inside the training set, so they would leak into the fusion search.
+# They still vote on TEST_NBEST below.
 OOF_NBEST: dict[str, list] = defaultdict(list)
 for d in DECODES:
+    if d["tag"].startswith("full_"):     # its "validation" lines were in its training set
+        continue
     for image_id, cands in d["oof"].items():
         for c in cands:
             OOF_NBEST[image_id].append({**c, "model": d["tag"]})
@@ -5045,16 +5204,19 @@ def build_features(nbest: dict, ids: Sequence[str], fold_of: dict,
     feats = {}
     for image_id in progress(ids, desc="features", unit="line"):
         lm, lex = fold_resources(fold_of.get(image_id, -1))
+        n_models = max(1, len({c.get("model") for c in nbest.get(image_id, [])
+                               if family_of(c) in families}))
         agg: dict[str, dict] = {}
         for c in nbest.get(image_id, []):
             fam = family_of(c)
             if fam not in families:
                 continue
             text = clean_candidate(c["text"], restrict, collapse)
-            rec = agg.setdefault(text, {"vlm": [], "ctc": []})
+            rec = agg.setdefault(text, {"vlm": [], "ctc": [], "votes": 0.0})
             rec[fam].append(float(c["score"]))
+            rec["votes"] += 1.0 / n_models
         if not agg:
-            agg[""] = {"vlm": [-50.0], "ctc": []}
+            agg[""] = {"vlm": [-50.0], "ctc": [], "votes": 0.0}
 
         v_all = [x for r in agg.values() for x in r["vlm"]]
         c_all = [x for r in agg.values() for x in r["ctc"]]
@@ -5072,7 +5234,7 @@ def build_features(nbest: dict, ids: Sequence[str], fold_of: dict,
             rows.append([
                 float(v.max()) if v.size else v_floor,
                 float(v.mean()) if v.size else v_floor,
-                math.log1p(v.size),
+                math.log1p(rec["votes"]),
                 lm.logprob_per_char(text),
                 lex.oov_rate(text),
                 abs((len(text) - lex.mean_chars) / lex.std_chars),
@@ -5290,6 +5452,32 @@ for name, feats_, pc in ladder:
 LADDER = pd.DataFrame(rows)
 print(LADDER.to_string(index=False))
 LADDER.to_csv(OUT / "postprocessing_ladder.csv", index=False)
+
+# How much each view and each model adds. If "no photometric" matches "ALL views",
+# set tta_photometric=False in CLI_OVERRIDES (new session not required for that
+# flag). If the two-model row clearly beats either single model, the ensemble is
+# the lever.
+def _subset_score(keep_view=None, keep_model=None):
+    nb = {i: [c for c in cs
+              if (keep_view is None or c["view"] in keep_view)
+              and (keep_model is None or c["model"] in keep_model)]
+          for i, cs in OOF_NBEST.items()}
+    nb = {i: cs for i, cs in nb.items() if cs}
+    ids = [i for i in OOF_IDS if i in nb]
+    feats = build_features(nb, ids, FOLD_OF, restrict=POST.restrict_charset, collapse=POST.collapse)
+    pred = apply_post(feats, ids, POST,
+                      lexicon_for=lambda i: fold_resources(FOLD_OF.get(i, -1))[1])
+    refs = train_df.set_index("ID").loc[ids, "Target"].tolist()
+    return competition_score(refs, [pred[i] for i in ids])
+
+_views = sorted({c["view"] for cs in OOF_NBEST.values() for c in cs})
+_models = sorted({c["model"] for cs in OOF_NBEST.values() for c in cs})
+rows = [("ALL views, ALL models", _subset_score())]
+rows += [(f"view {v} only", _subset_score(keep_view={v})) for v in _views]
+rows += [(f"model {m} only", _subset_score(keep_model={m})) for m in _models]
+rows += [(f"no photometric", _subset_score(keep_view={v for v in _views if v.endswith("identity")}))]
+for name, r in rows:
+    print(f"{name:<28} score {r['score']:.5f}  CER {r['cer']:.4f}  WER {r['wer']:.4f}")
 
 # Error inspection: the worst out-of-fold lines, to decide where to spend next.
 _final_oof = apply_post(OOF_FEATS, OOF_IDS, POST,
@@ -5520,38 +5708,36 @@ NOTIFY.finished(best_val, BASELINE["score"], SUB_PATH)
 
 # ## 18. Where the remaining points are
 #
-# Ordered by expected gain per GPU-hour, based on the diagnostics printed above.
+# Ordered by expected gain per GPU-hour after the fold-0 run (best step 532/666,
+# post-processing +0.0026, GRPO reward_std ~0.03, EMA ≈ raw).
 #
-# 1. **Train more folds.** Ensembling is the most reliable lever in this pipeline —
-#    each additional fold adds independent hypotheses to the ROVER vote. Go from
-#    `train_folds = (0,)` to all five before tuning anything else.
-# 2. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
+# 1. **Read the view/model ablation table** printed after the post-processing
+#    ladder. If "no photometric" matches "ALL views", set `tta_photometric=False`
+#    in `CLI_OVERRIDES` and save a third of decode time. If two models beat either
+#    one, keep spending on voters rather than on GRPO or rank.
+# 2. **More voters, then continue the first adapter.** `RUN_PLAN` trains
+#    `fold0_seed7` (same val fold, a real two-model OOF) and `full_from42`
+#    (warm-start of fold0_seed42 on every labelled line). Paste the ablation
+#    table before buying another seed.
+# 3. **Resolution, only if time remains.** `line_height=192` with
+#    `max_line_width=3840` needs its *own* session: `CACHE_DIR` is computed once
+#    from CFG at import, and `load_line` reads that directory. Drop
+#    `per_device_batch_size` to 4 and `grad_accum` to 8 so the effective batch
+#    stays 32.
+# 4. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
 #    the N-best list is far above the fused score, the ranking is the bottleneck:
-#    raise `n_best`, add TTA views, and re-run the weight search. If the oracle is
-#    close to the fused score, the *model* is the bottleneck: train longer, raise
-#    `line_height`, or move to a larger backbone.
-# 3. **Resolution.** `line_height` is the single most influential image knob. If VRAM
-#    allows, 192 with `max_line_width = 3840` gives the vision tower noticeably more
-#    signal per character, at roughly 1.4x the step time.
-# 4. **Seed ensembling.** Two seeds on the same fold produce genuinely different error
-#    patterns and fuse almost as well as two different folds, without shrinking the
-#    training set. Run `train_fold(0, tag="fold0_seedB")` with `CFG.seed` changed and
-#    append it to `RUNS`; the ROVER vote picks the diversity up for free.
-# 5. **Mode diversity.** `CFG.finetune_mode = "full"` on a 4B backbone produces a
-#    model that fails differently from the 8B LoRA one. Two *different* models fuse
-#    better than two runs of the same recipe, so this is worth more as an ensemble
-#    member than as a replacement.
-# 6. **GRPO steps.** GRPO is on by default and self-gating, so the question is only
-#    how much of it to buy: `grpo_steps` is the knob, and the printed
-#    `[grpo] SFT x vs GRPO y` line tells you whether more would pay. If the delta is
-#    positive and still growing at 300 steps, raise it.
+#    raise `n_best` and re-run the weight search. If the oracle is close, the
+#    *model* is the bottleneck.
+# 5. **GRPO is off.** Re-enable it only if a previous verdict tab shows a gain
+#    clearly above +0.005. A delta under that on 320 samples is noise, and
+#    `accepted = delta > 0` would have treated noise as a win.
+# 6. **Do not raise `lora_r`.** Training reward ~0.98 vs held-out ~0.905 is a
+#    generalisation gap, not a capacity problem.
 # 7. **Read the kraken CTC verdict.** The summary prints the zero-shot and
 #    fine-tuned PP-OCRv6 scores and whether the fusion gate kept it. If the
 #    fine-tuned CTC top-1 is within a few thousandths of the VLM, it is a genuine
-#    second opinion: try `ctc_epochs=80`, `ctc_line_height=128` with
-#    `ctc_max_width=5120`, or StackMix lines in its training set. If it is far
-#    behind, it still earns its place through the `c_sim` anchor on the lines where
-#    the VLM loops — check the gate delta rather than dropping it on instinct.
+#    second opinion. If it is far behind, it still earns its place through the
+#    `c_sim` anchor on the lines where the VLM loops.
 # 8. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
 #    at high aspect ratios, they are being squashed by `max_line_width` and deserve a
 #    dedicated higher-budget decoding pass.

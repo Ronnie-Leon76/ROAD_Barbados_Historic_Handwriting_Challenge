@@ -82,16 +82,19 @@ def build_features(nbest: dict, ids: Sequence[str], fold_of: dict,
     feats = {}
     for image_id in progress(ids, desc="features", unit="line"):
         lm, lex = fold_resources(fold_of.get(image_id, -1))
+        n_models = max(1, len({c.get("model") for c in nbest.get(image_id, [])
+                               if family_of(c) in families}))
         agg: dict[str, dict] = {}
         for c in nbest.get(image_id, []):
             fam = family_of(c)
             if fam not in families:
                 continue
             text = clean_candidate(c["text"], restrict, collapse)
-            rec = agg.setdefault(text, {"vlm": [], "ctc": []})
+            rec = agg.setdefault(text, {"vlm": [], "ctc": [], "votes": 0.0})
             rec[fam].append(float(c["score"]))
+            rec["votes"] += 1.0 / n_models
         if not agg:
-            agg[""] = {"vlm": [-50.0], "ctc": []}
+            agg[""] = {"vlm": [-50.0], "ctc": [], "votes": 0.0}
 
         v_all = [x for r in agg.values() for x in r["vlm"]]
         c_all = [x for r in agg.values() for x in r["ctc"]]
@@ -109,7 +112,7 @@ def build_features(nbest: dict, ids: Sequence[str], fold_of: dict,
             rows.append([
                 float(v.max()) if v.size else v_floor,
                 float(v.mean()) if v.size else v_floor,
-                math.log1p(v.size),
+                math.log1p(rec["votes"]),
                 lm.logprob_per_char(text),
                 lex.oov_rate(text),
                 abs((len(text) - lex.mean_chars) / lex.std_chars),
@@ -328,6 +331,34 @@ for name, feats_, pc in ladder:
 LADDER = pd.DataFrame(rows)
 print(LADDER.to_string(index=False))
 LADDER.to_csv(OUT / "postprocessing_ladder.csv", index=False)
+
+# %%
+# How much each view and each model adds. If "no photometric" matches "ALL views",
+# set tta_photometric=False in CLI_OVERRIDES (new session not required for that
+# flag). If the two-model row clearly beats either single model, the ensemble is
+# the lever.
+def _subset_score(keep_view=None, keep_model=None):
+    nb = {i: [c for c in cs
+              if (keep_view is None or c["view"] in keep_view)
+              and (keep_model is None or c["model"] in keep_model)]
+          for i, cs in OOF_NBEST.items()}
+    nb = {i: cs for i, cs in nb.items() if cs}
+    ids = [i for i in OOF_IDS if i in nb]
+    feats = build_features(nb, ids, FOLD_OF, restrict=POST.restrict_charset, collapse=POST.collapse)
+    pred = apply_post(feats, ids, POST,
+                      lexicon_for=lambda i: fold_resources(FOLD_OF.get(i, -1))[1])
+    refs = train_df.set_index("ID").loc[ids, "Target"].tolist()
+    return competition_score(refs, [pred[i] for i in ids])
+
+_views = sorted({c["view"] for cs in OOF_NBEST.values() for c in cs})
+_models = sorted({c["model"] for cs in OOF_NBEST.values() for c in cs})
+rows = [("ALL views, ALL models", _subset_score())]
+rows += [(f"view {v} only", _subset_score(keep_view={v})) for v in _views]
+rows += [(f"model {m} only", _subset_score(keep_model={m})) for m in _models]
+rows += [(f"no photometric", _subset_score(keep_view={v for v in _views if v.endswith("identity")}))]
+for name, r in rows:
+    print(f"{name:<28} score {r['score']:.5f}  CER {r['cer']:.4f}  WER {r['wer']:.4f}")
+
 
 # %%
 # Error inspection: the worst out-of-fold lines, to decide where to spend next.

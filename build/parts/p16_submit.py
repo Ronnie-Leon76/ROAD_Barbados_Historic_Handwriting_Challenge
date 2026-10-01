@@ -215,38 +215,36 @@ NOTIFY.finished(best_val, BASELINE["score"], SUB_PATH)
 # %% [markdown]
 # ## 18. Where the remaining points are
 #
-# Ordered by expected gain per GPU-hour, based on the diagnostics printed above.
+# Ordered by expected gain per GPU-hour after the fold-0 run (best step 532/666,
+# post-processing +0.0026, GRPO reward_std ~0.03, EMA ≈ raw).
 #
-# 1. **Train more folds.** Ensembling is the most reliable lever in this pipeline —
-#    each additional fold adds independent hypotheses to the ROVER vote. Go from
-#    `train_folds = (0,)` to all five before tuning anything else.
-# 2. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
+# 1. **Read the view/model ablation table** printed after the post-processing
+#    ladder. If "no photometric" matches "ALL views", set `tta_photometric=False`
+#    in `CLI_OVERRIDES` and save a third of decode time. If two models beat either
+#    one, keep spending on voters rather than on GRPO or rank.
+# 2. **More voters, then continue the first adapter.** `RUN_PLAN` trains
+#    `fold0_seed7` (same val fold, a real two-model OOF) and `full_from42`
+#    (warm-start of fold0_seed42 on every labelled line). Paste the ablation
+#    table before buying another seed.
+# 3. **Resolution, only if time remains.** `line_height=192` with
+#    `max_line_width=3840` needs its *own* session: `CACHE_DIR` is computed once
+#    from CFG at import, and `load_line` reads that directory. Drop
+#    `per_device_batch_size` to 4 and `grad_accum` to 8 so the effective batch
+#    stays 32.
+# 4. **Check the oracle gap** printed at the end of `Section 14`. If the oracle over
 #    the N-best list is far above the fused score, the ranking is the bottleneck:
-#    raise `n_best`, add TTA views, and re-run the weight search. If the oracle is
-#    close to the fused score, the *model* is the bottleneck: train longer, raise
-#    `line_height`, or move to a larger backbone.
-# 3. **Resolution.** `line_height` is the single most influential image knob. If VRAM
-#    allows, 192 with `max_line_width = 3840` gives the vision tower noticeably more
-#    signal per character, at roughly 1.4x the step time.
-# 4. **Seed ensembling.** Two seeds on the same fold produce genuinely different error
-#    patterns and fuse almost as well as two different folds, without shrinking the
-#    training set. Run `train_fold(0, tag="fold0_seedB")` with `CFG.seed` changed and
-#    append it to `RUNS`; the ROVER vote picks the diversity up for free.
-# 5. **Mode diversity.** `CFG.finetune_mode = "full"` on a 4B backbone produces a
-#    model that fails differently from the 8B LoRA one. Two *different* models fuse
-#    better than two runs of the same recipe, so this is worth more as an ensemble
-#    member than as a replacement.
-# 6. **GRPO steps.** GRPO is on by default and self-gating, so the question is only
-#    how much of it to buy: `grpo_steps` is the knob, and the printed
-#    `[grpo] SFT x vs GRPO y` line tells you whether more would pay. If the delta is
-#    positive and still growing at 300 steps, raise it.
+#    raise `n_best` and re-run the weight search. If the oracle is close, the
+#    *model* is the bottleneck.
+# 5. **GRPO is off.** Re-enable it only if a previous verdict tab shows a gain
+#    clearly above +0.005. A delta under that on 320 samples is noise, and
+#    `accepted = delta > 0` would have treated noise as a win.
+# 6. **Do not raise `lora_r`.** Training reward ~0.98 vs held-out ~0.905 is a
+#    generalisation gap, not a capacity problem.
 # 7. **Read the kraken CTC verdict.** The summary prints the zero-shot and
 #    fine-tuned PP-OCRv6 scores and whether the fusion gate kept it. If the
 #    fine-tuned CTC top-1 is within a few thousandths of the VLM, it is a genuine
-#    second opinion: try `ctc_epochs=80`, `ctc_line_height=128` with
-#    `ctc_max_width=5120`, or StackMix lines in its training set. If it is far
-#    behind, it still earns its place through the `c_sim` anchor on the lines where
-#    the VLM loops — check the gate delta rather than dropping it on instinct.
+#    second opinion. If it is far behind, it still earns its place through the
+#    `c_sim` anchor on the lines where the VLM loops.
 # 8. **Longest lines.** Inspect the worst-CER examples printed above: if they cluster
 #    at high aspect ratios, they are being squashed by `max_line_width` and deserve a
 #    dedicated higher-budget decoding pass.

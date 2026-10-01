@@ -46,9 +46,9 @@
 # prior — and note that the two modes make *different* errors, so a LoRA fold and a
 # full-fine-tune fold fuse well together in the ROVER vote.
 #
-# The middle option, and the one worth reaching for first if LoRA looks
-# capacity-limited, is not full fine-tuning but a larger rank: `lora_r = 64` with
-# `lora_alpha = 128` roughly doubles adapter capacity for a few GB.
+# A larger rank (`lora_r = 64`) is the wrong next step on this data: training
+# reward is already ~0.98 against ~0.905 held-out, which is a generalisation gap.
+# More seeds and more labelled lines beat more adapter capacity.
 
 # %%
 from transformers import Trainer, TrainingArguments, TrainerCallback
@@ -318,7 +318,10 @@ def make_training_args(cfg: Config, out_dir: Path, steps_per_epoch: int,
 
 def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
                train_override: pd.DataFrame | None = None,
-               val_override: pd.DataFrame | None = None) -> dict:
+               val_override: pd.DataFrame | None = None,
+               adapter_path: str | Path | None = None) -> dict:
+    """Train one adapter. `adapter_path` warm-starts from an existing LoRA instead
+    of initialising a new one on the base model."""
     cfg = cfg or CFG
     tag = tag or f"fold{fold}_seed{cfg.seed}"
     tr_df, va_df = fold_frames(fold)
@@ -347,17 +350,23 @@ def train_fold(fold: int, cfg: Config = None, tag: str | None = None,
     print(f"[train] mode {cfg.finetune_mode} | seed {cfg.seed} | "
           f"determinism {'on' if cfg.deterministic else 'off'}")
     print(f"[train] cosine annealing: warmup {cfg.warmup_ratio:.0%}, floor {cfg.min_lr_ratio:.0%}"
-          f" of peak lr {cfg.lr:g}\n{'='*78}")
+          f" of peak lr {cfg.lr:g}")
+    if adapter_path:
+        print(f"[train] warm-start from {adapter_path}")
+    print("=" * 78)
 
     tb = TBLogger(tag, enabled=cfg.tensorboard)
     tb.text("config", "```json\n" + json.dumps(
         {k: (list(v) if isinstance(v, tuple) else v) for k, v in asdict(cfg).items()},
         indent=2) + "\n```")
 
-    model = build_model(cfg, for_training=True)
+    model = build_model(cfg, adapter_path=adapter_path, for_training=True)
     args = make_training_args(cfg, OUT / "checkpoints" / tag, steps_per_epoch, tb.dir)
 
-    ema = AdapterEMA(model, cfg.ema_decay) if cfg.ema_decay and cfg.ema_decay > 0 else None
+    # warmup_steps=4 -> decay (1+n)/(5+n), a running average over roughly the last
+    # quarter of a 666-step run. The class default of 20 never reaches cfg.ema_decay
+    # (0.999) in that many steps, which is why raw and EMA scored the same.
+    ema = AdapterEMA(model, cfg.ema_decay, warmup_steps=4) if cfg.ema_decay and cfg.ema_decay > 0 else None
     val_cb = GenerationEvalCallback(model, PROCESSOR, cfg, va_df, eval_every,
                                     OUT / "checkpoints", ema=ema,
                                     max_samples=cfg.eval_max_samples, tag=tag, tb=tb)

@@ -35,7 +35,7 @@ class Notifier:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.to = os.environ.get("NOTIFY_EMAIL_TO", "").strip()
-        self.host = os.environ.get("SMTP_HOST", "").strip()
+        self.host = os.environ.get("SMTP_HOST", "smtp.gmail.com").strip()
         self.port = int(os.environ.get("SMTP_PORT", "587") or 587)
         self.user = os.environ.get("SMTP_USER", "").strip()
         self.password = os.environ.get("SMTP_PASSWORD", "").strip()

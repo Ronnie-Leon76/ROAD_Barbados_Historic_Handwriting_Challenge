@@ -90,14 +90,10 @@
 # cache disabled so a `/tmp` vs `/workspace` split cannot raise EXDEV; if no
 # matching wheel exists the model falls back to SDPA and training still runs.
 #
-# To mirror checkpoints to the Hugging Face Hub, set a **write** token before running
-# `Section 2.3` — on RunPod the cleanest way is a pod secret, so the token never
-# reaches the notebook file:
-#
-# ```python
-# import os; os.environ["HF_TOKEN"] = "hf_..."   # or set it in the pod environment
-# CFG.hf_repo_id = "your-name/road-barbados-htr"
-# ```
+# To mirror checkpoints to the Hugging Face Hub, export a **write** token in the
+# pod environment (or gitignored `.env`) *before* running `Section 2.3`. Do not
+# paste it into a notebook cell — that is how tokens end up in checkpoints and
+# git history. Section 2.3 asserts the token is present and sets the repo id.
 
 # %%
 import os as _os

@@ -1,74 +1,173 @@
 # %% [markdown]
 # ## 12. Run training
 #
-# `CFG.train_folds` controls the budget. Guidance for a single 48 GB card:
+# Fold-0 already peaked at step 532 of 666 (val 0.90477, raw). More epochs on that
+# same run will not help. We **pull those LoRA weights** from the hub and continue
+# from them:
 #
-# | Setting | Wall clock | Use for |
+# * `fold0_seed42` is restored, never retrained.
+# * `full_from42` warm-starts that adapter on every labelled line, at a lower LR,
+#   so the extra ~25% of data can move the weights without wiping the first run.
+# * `fold0_seed7` is a *new* adapter on the same val fold. Fusion needs a second
+#   error pattern; continuing seed-42 a second time would not give it one.
+#
+# Tags that already exist on the hub or in `runs.json` are skipped.
+#
+# Budget on a 48 GB card, including decode:
+#
+# | Tag | Wall clock | Role |
 # |---|---|---|
-# | `train_folds = (0,)` | ~45 min | first end-to-end pass, sanity check |
-# | `train_folds = (0, 1, 2)` | ~2.5 h | ensembling starts paying off here |
-# | `train_folds = (0, 1, 2, 3, 4)` | ~4 h | full out-of-fold coverage for tuning |
+# | `fold0_seed42` | restored | first voter, pulled from the hub |
+# | `fold0_seed7` | ~3 h | second voter, same validation fold, from scratch |
+# | `full_from42` | ~1.5 h | continue seed-42 on all labelled lines |
 #
-# Each fold writes only its best adapter (selected on generation CER/WER, not loss),
-# so disk stays bounded regardless of how many evaluations run. Each fold is also
-# pushed to the hub the moment it finishes, so an interrupted run loses at most the
-# fold that was in flight.
-#
-# With `CFG.hf_resume = True` this cell downloads a previous run's checkpoints
-# instead of training and jumps straight to decoding — the same weights, therefore
-# the same score, without repeating the GPU hours.
+# High-res (`line_height=192`) is a *different* session: `CACHE_DIR` is fixed at
+# import by `load_line`. Do not uncomment those `CLI_OVERRIDES` here.
 
 # %%
+import dataclasses
+
+RUN_PLAN = [
+    dict(tag="fold0_seed42", fold=0),                          # restored from hub
+    dict(tag="fold0_seed7",  fold=0, over=dict(seed=7)),       # 2nd voter, from scratch
+    dict(tag="full_from42",  fold=0,                           # continue fold0_seed42
+         over=dict(seed=42, epochs=2.0, lr=4e-5),
+         init_from="fold0_seed42"),
+]
+
 RUN_TRAINING = True     # set False to reuse artifacts/runs.json from a previous pass
-RUNS: list[dict] = []
+
+
+def _is_checkpoint_dir(path: Path) -> bool:
+    return path.is_dir() and (
+        (path / "adapter_config.json").exists()
+        or any(path.glob("adapter_model*.safetensors"))
+        or any(path.glob("*.safetensors"))
+    )
+
+
+def _fill_val_ids(run: dict) -> dict:
+    if run.get("val_ids"):
+        return run
+    fold = int(run.get("fold", 0))
+    try:
+        _, va = fold_frames(fold)
+        run["val_ids"] = va["ID"].tolist()
+    except Exception:
+        run["val_ids"] = []
+    return run
+
+
+def _synthesize_run(tag: str, path: Path) -> dict:
+    fold = 0
+    m = re.match(r"fold(\d+)_", tag)
+    if m:
+        fold = int(m.group(1))
+    run = {
+        "tag": tag,
+        "fold": fold,
+        "best": {"path": str(path), "score": float("nan"), "source": "hub", "step": None},
+        "history": pd.DataFrame(),
+        "seed": CFG.seed,
+        "finetune_mode": CFG.finetune_mode,
+    }
+    print(f"[hub] synthesized run record for {tag} <- {path}")
+    return _fill_val_ids(run)
 
 
 def restore_runs_from_hub() -> list:
-    """Pull a previous run's checkpoints back down so decoding can start immediately."""
+    """Pull fold0_seed42 (and any later voters) so we can continue instead of retrain."""
     local = OUT / "hub_restore"
     root = HUB.pull(["runs.json", "checkpoints/**", "history/**"], local)
     if root is None:
         print("[hub] nothing restored - falling back to local artefacts")
         return []
-    with open(Path(root) / "runs.json") as fh:
-        runs = json.load(fh)
-    for r in runs:
-        tag = r["tag"]
-        # Rewrite the recorded paths onto whatever this machine calls them.
-        for key, remote in (("best", f"checkpoints/{tag}"),
-                            ("grpo", f"checkpoints/grpo_fold{r['fold']}")):
-            path = Path(root) / remote
-            if not path.exists():
+    root = Path(root)
+    runs: list = []
+    runs_path = root / "runs.json"
+    if runs_path.exists():
+        with open(runs_path) as fh:
+            runs = json.load(fh)
+        for r in runs:
+            tag = r["tag"]
+            for key, remote in (("best", f"checkpoints/{tag}"),
+                                ("grpo", f"checkpoints/grpo_fold{r.get('fold', 0)}")):
+                path = root / remote
+                if not path.exists():
+                    continue
+                if key == "best":
+                    r.setdefault("best", {})["path"] = str(path)
+                else:
+                    r["grpo_path"] = str(path)
+            hist = root / "history" / f"val_history_{tag}.csv"
+            r["history"] = pd.read_csv(hist) if hist.exists() else pd.DataFrame()
+            _fill_val_ids(r)
+    known = {r["tag"] for r in runs}
+    ckpt_root = root / "checkpoints"
+    if ckpt_root.exists():
+        for d in sorted(ckpt_root.iterdir()):
+            if d.name in known or not _is_checkpoint_dir(d):
                 continue
-            if key == "best":
-                r["best"]["path"] = str(path)
-            else:
-                r["grpo_path"] = str(path)
-        hist = Path(root) / "history" / f"val_history_{tag}.csv"
-        r["history"] = pd.read_csv(hist) if hist.exists() else pd.DataFrame()
-    print(f"[hub] restored {len(runs)} runs from {HUB.repo_id}")
+            runs.append(_synthesize_run(d.name, d))
+    if not runs:
+        print("[hub] snapshot had no usable checkpoints - falling back to local artefacts")
+        return []
+    print(f"[hub] restored {len(runs)} run(s) from {HUB.repo_id}: "
+          + ", ".join(r["tag"] for r in runs))
     return runs
 
 
-if CFG.hf_resume:
-    RUNS = restore_runs_from_hub()
-    RUN_TRAINING = not RUNS      # only train if the restore came back empty
+def _load_local_runs() -> list:
+    path = OUT / "runs.json"
+    if not path.exists():
+        return []
+    with open(path) as fh:
+        runs = json.load(fh)
+    print(f"[runs] restored {len(runs)} runs from disk")
+    return runs
 
-if RUN_TRAINING:
-    stage(f"training {len(CFG.train_folds)} fold(s), mode {CFG.finetune_mode}")
-    NOTIFY.run_started()
-    _folds = progress(CFG.train_folds, desc="folds", unit="fold")
-    for fold in _folds:
-        RUNS.append(train_fold(fold))
-        _folds.set_postfix_str(f"best {RUNS[-1]['best']['score']:.5f}", refresh=False)
-    _folds.close()
+
+RUNS = restore_runs_from_hub() if CFG.hf_resume else []
+if not RUNS:
+    RUNS = _load_local_runs()
+_done = {r["tag"] for r in RUNS}
+
+
+def _save_runs():
     with open(OUT / "runs.json", "w") as fh:
         json.dump([{k: v for k, v in r.items() if k != "history"} for r in RUNS], fh, indent=2)
-    HUB.push_file(OUT / "runs.json", "runs.json", "record fold results")
+    HUB.push_file(OUT / "runs.json", "runs.json", "record runs")
+
+
+if RUN_TRAINING:
+    stage(f"training {len(RUN_PLAN)} run(s)")
+    if any(spec["tag"] not in _done for spec in RUN_PLAN):
+        NOTIFY.run_started()
+    for spec in RUN_PLAN:
+        if spec["tag"] in _done:
+            print(f"[runs] {spec['tag']} already trained - skipping")
+            continue
+        cfg = dataclasses.replace(CFG, **spec.get("over", {}))
+        kw = {}
+        if spec["tag"].startswith("full_"):
+            # Train on every labelled line. The 64-line "val" is only a sanity check;
+            # it sits inside the training set, so checkpoint selection is meaningless here.
+            kw = dict(train_override=train_df[["ID", "Target"]],
+                      val_override=train_df.sample(64, random_state=0)[["ID", "Target"]])
+        parent = spec.get("init_from")
+        if parent:
+            src = next((r for r in RUNS if r["tag"] == parent), None)
+            path = Path(src["best"]["path"]) if src and src.get("best", {}).get("path") else None
+            if path is None or not path.exists():
+                raise SystemExit(f"[runs] {spec['tag']} needs {parent} on disk first "
+                                 f"(hub resume failed to pull it)")
+            kw["adapter_path"] = path
+            print(f"[runs] {spec['tag']} continues from {parent} ({path})")
+        RUNS.append(train_fold(spec["fold"], cfg=cfg, tag=spec["tag"], **kw))
+        _done.add(spec["tag"])
+        _save_runs()
 elif not RUNS:
-    with open(OUT / "runs.json") as fh:
-        RUNS = json.load(fh)
-    print(f"[runs] restored {len(RUNS)} runs from disk")
+    RUNS = _load_local_runs()
 
 for r in RUNS:
     print(f"  {r['tag']:<24} best {r['best']['score']:.5f} ({r['best']['source']}) "
@@ -104,18 +203,16 @@ if RUNS and isinstance(RUNS[0].get("history"), pd.DataFrame) and len(RUNS[0]["hi
 # **competition metric as the reward**, and pushing probability mass towards the
 # candidates that beat their group's average.
 #
-# This stage is on by default, but it is the highest-variance part of the notebook:
-# it needs a working TRL vision-language `GRPOTrainer`, every step samples `G`
-# completions so it is slow, and a bad reward scale can undo the SFT gains. Three
-# guards make it safe to leave enabled:
+# This stage is **off** by default. On the fold-0 run the 6 samples per image were
+# nearly identical (`reward_std` 0.02–0.04), so the advantages are noise on 320
+# validation lines. Re-enable `run_grpo` in `CLI_OVERRIDES` only if you have a
+# verdict-tab gain clearly above +0.005. Three guards still apply if you do:
 #
 # * **A KL leash** (`beta = 0.02`) back to the SFT policy, so it polishes rather than
 #   wanders.
 # * **A tiny learning rate** (`2e-6`), two orders below the SFT rate.
-# * **An acceptance test.** The polished adapter is decoded on held-out data from the
-#   same fold and compared with the SFT adapter that produced it. If it does not win,
-#   it is discarded and the SFT adapter continues to the decoding stage. Turning GRPO
-#   on therefore cannot make the submission worse — only slower.
+# * **An acceptance test** with a 0.004 margin (320-sample noise is about ±0.003).
+#   If the polished adapter does not beat SFT by that much, it is discarded.
 #
 # The gate is the important part. Competitors reported real gains from GRPO on this
 # leaderboard, but an ungated RL stage is precisely the kind of thing that silently
@@ -253,7 +350,9 @@ def grpo_stage(run: dict, cfg: Config = None) -> dict:
     tb.scalars({"sft": sft_score, "grpo": grpo_score, "delta": delta}, 0, prefix="verdict/")
     tb.close()
 
-    accepted = delta > 0
+    # 320-sample noise is about ±0.003; treating any positive delta as a win
+    # accepts noise. Require a margin that is larger than that.
+    accepted = delta > 0.004
     if accepted:
         run["grpo_path"] = grpo_path
         print(f"[grpo] fold {fold}: ACCEPTED, decoding will use the polished weights")
@@ -269,8 +368,13 @@ def grpo_stage(run: dict, cfg: Config = None) -> dict:
 
 if CFG.run_grpo and RUNS:
     stage("GRPO polish + acceptance test")
-    RUNS = [grpo_stage(r) for r in progress(RUNS, desc="grpo", unit="fold")]
+    _todo = [r for r in RUNS if not r["tag"].startswith("full_")]
+    _skipped = [r for r in RUNS if r["tag"].startswith("full_")]
+    _todo = [grpo_stage(r) for r in progress(_todo, desc="grpo", unit="fold")]
+    RUNS = _todo + _skipped
     _kept = sum("grpo_path" in r for r in RUNS)
-    print(f"\n[grpo] {_kept}/{len(RUNS)} folds improved and will decode with GRPO weights")
+    print(f"\n[grpo] {_kept}/{len(_todo)} fold models improved and will decode with GRPO weights")
+    if _skipped:
+        print(f"[grpo] skipped {len(_skipped)} all-data run(s) (leaky val)")
 else:
     print("[grpo] disabled (CFG.run_grpo = False)")

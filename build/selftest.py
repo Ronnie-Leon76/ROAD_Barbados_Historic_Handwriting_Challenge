@@ -170,9 +170,11 @@ def main() -> int:
     print("=" * 70, "\n[1/8] config", sep="")
     check_requirements()
     # Config cell defines Config/CFG/paths; the licence guard needs the network.
+    # Cell 0 is CLI_OVERRIDES; cell 1 builds CFG; cell 2 is the licence table.
     cfg_cells = cells_of(PARTS / "p02_config.py")
     exec(compile(cfg_cells[0], "p02#0", "exec"), ns)
-    exec(compile(cfg_cells[1].split("CFG_LICENCE =")[0], "p02#1", "exec"), ns)
+    exec(compile(cfg_cells[1], "p02#1", "exec"), ns)
+    exec(compile(cfg_cells[2].split("CFG_LICENCE =")[0], "p02#2", "exec"), ns)
     ns["CFG_LICENCE"] = "apache-2.0"
     licence_ok = True
     try:
@@ -198,20 +200,24 @@ def main() -> int:
     assert ns["apply_finetune_mode"](ns["Config"](), 48.0).lr == ns["Config"]().lr, \
         "lora mode must not be rewritten"
 
+    assert ns["CFG"].run_grpo is False, "GRPO must stay off; re-enable only after a real verdict-tab gain"
+    assert ns["CLI_OVERRIDES"].get("run_grpo") is False
+
     print("=" * 70, "\n[1b/8] reproducibility + hub", sep="")
     run_part(ns, "p02a_repro.py")
+    from dataclasses import replace as _dc_replace
     fp1 = ns["RUN_FINGERPRINT"]
     fp2 = ns["build_fingerprint"](ns["CFG"])
     assert fp1["run_id"] == fp2["run_id"], "fingerprint is not stable across calls"
-    _other = ns["Config"](seed=ns["CFG"].seed + 1, work_dir=ns["CFG"].work_dir)
+    _other = _dc_replace(ns["CFG"], seed=ns["CFG"].seed + 1)
     assert ns["build_fingerprint"](_other)["run_id"] != fp1["run_id"], \
         "fingerprint ignores the seed"
-    _renamed = ns["Config"](hf_repo_id="someone/elsewhere", work_dir=ns["CFG"].work_dir)
+    _renamed = _dc_replace(ns["CFG"], hf_repo_id="someone/elsewhere")
     assert ns["build_fingerprint"](_renamed)["config_hash"] == fp1["config_hash"], \
         "fingerprint should ignore hub settings"
     print(f"    fingerprint stable: run_id {fp1['run_id']}")
 
-    run_part(ns, "p02b_hub.py")
+    run_part(ns, "p02b_hub.py", skip_cells=(0,))
     assert ns["HUB"].enabled is False, "hub should be disabled without a repo id"
     assert ns["HUB"].push_file(ROOT / "README.md", "README.md") is False, \
         "disabled hub must no-op instead of raising"
@@ -362,6 +368,16 @@ def exercise_postprocessing(ns: dict) -> None:
 
     fold_of = dict(zip(train_df.ID, train_df.fold))
     feats = ns["build_features"](nbest, ids, fold_of, restrict=True, collapse=True)
+    _iid = ids[0]
+    f_one = ns["build_features"]({_iid: nbest[_iid]}, [_iid], fold_of, families=("vlm",))
+    f_two = ns["build_features"](
+        {_iid: nbest[_iid] + [{**c, "model": "m1"} for c in nbest[_iid]]},
+        [_iid], fold_of, families=("vlm",))
+    v_one = dict(zip(f_one[_iid]["texts"], f_one[_iid]["M"][:, 2]))
+    v_two = dict(zip(f_two[_iid]["texts"], f_two[_iid]["M"][:, 2]))
+    assert v_one.keys() == v_two.keys()
+    assert all(abs(v_one[t] - v_two[t]) < 1e-9 for t in v_one), "n_models must keep votes comparable"
+    print("    vote feature invariant to a duplicated second model")
     pc_plain = ns["PostConfig"](use_rover=False, repair=False)
     pc_rover = ns["PostConfig"](use_rover=True, rover_level="char", repair=False)
 

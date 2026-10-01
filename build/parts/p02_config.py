@@ -4,7 +4,8 @@
 # One object controls the whole run. Defaults are auto-scaled to the detected GPU:
 # an 8B backbone in bf16 on >= 40 GB cards, a 4B backbone or 4-bit QLoRA on smaller
 # ones. Every downstream cell reads from `CFG`, so a single edit here is enough to
-# change the experiment.
+# change the experiment. Session knobs go in the `CLI_OVERRIDES` cell immediately
+# below; `run_pipeline.py --set` merges on top of them.
 #
 # Three switches change the shape of the run rather than a hyperparameter:
 #
@@ -12,8 +13,24 @@
 # |---|---|
 # | `competition_mode` | **Leaderboard recipe**: all five folds + the kraken CTC branch. `--fast` and `--folds` still override it |
 # | `finetune_mode` | `"lora"` adapters (default) or `"full"` — every weight trained, with the learning rate, optimiser, batch shape and EMA re-derived to match |
-# | `run_grpo` | RL polish that optimises the leaderboard metric directly, kept only if it beats the SFT adapter out-of-fold |
+# | `run_grpo` | RL polish on the leaderboard metric. Off by default: with this data the 6 samples/image are nearly identical, so the advantages are noise |
 # | `hf_repo_id` | mirrors every checkpoint and artefact to the Hugging Face Hub so the run can be replayed exactly |
+
+# %%
+# Session knobs. argparse / `run_pipeline.py --set` merge on top (CLI wins).
+# Resolution is commented out on purpose: CACHE_DIR is computed once at import
+# from CFG.line_height / max_line_width, so a high-res run needs its own session.
+CLI_OVERRIDES = {
+    **dict(
+        run_grpo=False,
+        # --- high-res variant: run in its OWN session (cache dir is fixed at import) ---
+        # line_height=192, max_line_width=3840,
+        # per_device_batch_size=4, grad_accum=8,   # same effective batch of 32, avoids OOM
+        # --- only after the view ablation (Section 15) says dark/light add nothing ---
+        # tta_photometric=False,
+    ),
+    **globals().get("CLI_OVERRIDES", {}),
+}
 
 # %%
 def load_dotenv(path: str | Path = ".env") -> list:
@@ -169,10 +186,10 @@ class Config:
     lm_tune_iters: int = 400
 
     # ------------------------------------------------------- optional stages --
-    # GRPO optimises the leaderboard metric directly. It is on, but gated: the
-    # polished adapter is scored against the SFT one on held-out data and is only
-    # kept if it wins, so enabling it cannot make the submission worse.
-    run_grpo: bool = True
+    # GRPO optimises the leaderboard metric directly. It is off: on this data the
+    # 6 samples per image are nearly identical (reward_std ~0.02–0.04), so the
+    # advantages are noise. Re-enable only if the verdict tab shows a real gain.
+    run_grpo: bool = False
     grpo_steps: int = 300
     grpo_num_generations: int = 6
     grpo_lr: float = 2e-6
@@ -323,7 +340,7 @@ CFG = autoscale(CFG, GPU_VRAM_GB)
 if CFG.competition_mode:
     CFG.train_folds = tuple(range(CFG.n_folds))
     CFG.ctc_branch = True
-    print(f"[cfg] COMPETITION MODE: training folds {CFG.train_folds} + kraken CTC")
+    print(f"[cfg] COMPETITION MODE: CTC on folds {CFG.train_folds}; VLM runs follow RUN_PLAN")
 if not CFG.hf_repo_id:
     CFG.hf_repo_id = os.environ.get("HF_REPO_ID", "").strip()
 

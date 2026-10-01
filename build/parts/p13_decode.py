@@ -7,9 +7,10 @@
 # views; those pooled lists are the input to the fusion stage.
 #
 # Cost control: the number of forward passes is
-# `folds x (len(scales) + 2 if photometric) x beams`. On a 48 GB card, one adapter
+# `models x (len(scales) + 2 if photometric) x beams`. On a 48 GB card, one adapter
 # over the 1 374 test images with 4 views and 5 beams takes roughly an hour. Set
-# `FAST_DECODE = True` for a single greedy view while iterating.
+# `FAST_DECODE = True` for a single greedy view while iterating. Predictions are
+# pulled from / pushed to the hub so a dead pod does not redo 1–2 hours per adapter.
 
 # %%
 FAST_DECODE = False
@@ -58,6 +59,8 @@ def decode_run(run: dict, cfg: Config = None, force: bool = False) -> dict:
                               photometric=DECODE_PHOTOMETRIC, **DECODE_KW)
     save_nbest(oof, oof_path)
     save_nbest(test, test_path)
+    HUB.push_file(oof_path, f"preds/{oof_path.name}", f"decoded {tag} oof")
+    HUB.push_file(test_path, f"preds/{test_path.name}", f"decoded {tag} test")
 
     del engine, model
     free_gpu()
@@ -71,14 +74,18 @@ def decode_run(run: dict, cfg: Config = None, force: bool = False) -> dict:
 
 
 stage("decode out-of-fold + test")
+HUB.pull(["preds/**"], OUT)
 DECODES = [decode_run(r) for r in progress(RUNS, desc="adapters", unit="model")]
+HUB.push_folder(OUT / "preds", "preds", "decoded n-best lists")
 
 # %%
-# Assemble the out-of-fold table. With every fold trained this covers the whole
-# training set; with a subset it covers those folds only - still enough to tune the
-# post-processing, just noisier.
+# Assemble the out-of-fold table. All-data models are excluded: their "validation"
+# lines sat inside the training set, so they would leak into the fusion search.
+# They still vote on TEST_NBEST below.
 OOF_NBEST: dict[str, list] = defaultdict(list)
 for d in DECODES:
+    if d["tag"].startswith("full_"):     # its "validation" lines were in its training set
+        continue
     for image_id, cands in d["oof"].items():
         for c in cands:
             OOF_NBEST[image_id].append({**c, "model": d["tag"]})
